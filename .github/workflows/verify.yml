@@ -1,0 +1,33 @@
+name: Verify
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-harness:
+    name: Windows harness
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Verify with pinned OMP CLI
+        shell: pwsh
+        run: |
+          $ompPath = Join-Path $env:RUNNER_TEMP 'omp.exe'
+          $url = 'https://github.com/can1357/oh-my-pi/releases/download/v19.1.1/omp-windows-x64.exe'
+          $expectedHash = '4e18f472975bb87f9b1992f1d5981b9a1403fd559cdb3eb96f1f1a7d709096ef'
+          curl.exe --fail --silent --show-error --location --output $ompPath $url
+          if ($LASTEXITCODE -ne 0) { throw "OMP download failed with exit code $LASTEXITCODE." }
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $ompPath).Hash -ine $expectedHash) {
+            throw 'OMP release hash mismatch.'
+          }
+          $env:PI_CODING_AGENT_DIR = Join-Path $env:RUNNER_TEMP 'omp-harness-agent'
+          ./scripts/check-harness.ps1 -OmpPath $ompPath

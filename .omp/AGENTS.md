@@ -8,6 +8,21 @@ Keep standalone chat independent of project folders. A project chat has an expli
 
 The first desktop interaction is [opening a file from chat](../README.md#core-interaction-open-files-from-chat). Resolve file links against the workspace recorded with the message. Preview in a tab beside the same chat, without implicitly attaching or uploading the file.
 
+## Required skill routing
+
+Before work, name the relevant skill in the assignment and read its exact `skill://<name>` entry. Reread the current repository rules in the assigned worktree. Choose one primary skill per stage; use a specialist only for a distinct need.
+
+| Task | Skill to read |
+| --- | --- |
+| Resolve overlapping routes or an unclear skill choice | `omp-skill-router` |
+| Check OMP RPC, desktop framework, or browser API contracts | `documentation-lookup`; `contract-first` when freezing a shared interface |
+| Design or review chat, folder, or preview UI | `omp-ui-design-review`; `accessibility` when changing keyboard, focus, or screen-reader behavior |
+| Ship a user-visible feature or extend PR regression checks | `omp-feature-regression-gate`; `tdd` when adding a behavior regression test first |
+| Diagnose an unclear failure or a failed GitHub check | `omp-repro-debugging` for local reproduction; `omp-ci-gate-verify` for evidence from the exact GitHub run |
+| Make a completion claim or hand off a branch | `verification-before-completion`; `omp-git-handoff` for commit scope and integration |
+
+Use an allowed installed alternative if a skill is unavailable; record the substitution. Do not install skills, bypass a held or explicit-only route, or run a skill's bundled scripts without authorization. Report the skills actually used and the decisive check in the handoff. A skill is guidance, not permission or verification evidence.
+
 ## Agent workflow
 
 1. Start from a named commit. Read the canonical `.omp/STATUS.md` in the primary checkout. Record owner, absolute worktree, branch, base SHA, literal `Write` paths, and `Shared` dependencies before editing. Treat overlapping paths case-insensitively on Windows. Stop for an overlapping or ambiguous claim.

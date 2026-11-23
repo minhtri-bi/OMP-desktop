@@ -1,6 +1,6 @@
 # OMP Desktop
 
-A Windows-first workspace for local folders, standalone chat, project chat, and an embedded browser. OMP is the runtime, not another feature to rebuild. This initial commit sets up local collaboration; no app framework or dependencies have been selected.
+A Windows-first workspace for local folders, standalone chat, project chat, and an embedded browser. OMP is the runtime, not another feature to rebuild. See the [design mind map](docs/design.md) for scope and decision order. No app framework or dependencies have been selected.
 
 ## Core interaction: open files from chat
 
@@ -13,7 +13,7 @@ Match the Antigravity interaction: clicking a filename chip or file link in chat
 ## Start working
 
 - Read [project rules](.omp/AGENTS.md) and the primary checkout's local `.omp/STATUS.md`. The status file is intentionally ignored by Git. Create it in the primary checkout if starting from a fresh clone; do not copy it into linked worktrees.
-- Assign one owner per task with this contract: `Goal | base SHA | branch and absolute worktree | literal write paths | read-only dependencies | expected behavior | exact check`. New paths need an updated claim before editing.
+- Assign one owner per task with this contract: `Goal | base SHA | branch and absolute worktree | literal write paths | read-only dependencies | primary skill | expected and preserved behavior | exact check`. Follow the [required skill routes](.omp/AGENTS.md#required-skill-routing). New paths need an updated claim before editing.
 - The integrator owns shared interfaces, root build files, and integration. Keep dependent tasks queued until their required contract lands on an agreed base.
 
 From the primary checkout, after the initial commit, create each assigned worktree from the agreed base. Example when `main` is that base:
@@ -44,16 +44,16 @@ These are independent proposals, not active claims. Each agent owns the evidence
 
 The first integrated path must open a folder and display files from its chat in the right-hand pane. Switching to standalone chat must preserve each chat's own context. Both use the same OMP adapter. Verify this flow in the running Windows app before broadening the surface.
 
-## Verify the bootstrap
+## Verification and delivery
 
-These commands read local settings; they do not launch a worker or make a model request. Run them from the project root with OMP on `PATH`:
+Run the same harness check as CI from PowerShell with `omp` and Git on `PATH`:
 
 ```powershell
-omp --version
-omp config list --scope=project --json
-omp config get task.isolation.apply --json
-omp config get task.speculativeLaunch --json
-git check-ignore .omp/STATUS.md
+.\scripts\check-harness.ps1
 ```
 
-Both effective task settings must be `false`. The first disables automatic application by the built-in isolated task flow; the second disables speculative task starts. Neither setting changes permissions or OMP team approval. `git check-ignore` must print `.omp/STATUS.md`. There is no application build or app test yet.
+The [Verify workflow](.github/workflows/verify.yml) runs on Windows for PRs targeting `main`. It verifies the SHA-256 of the pinned OMP release, then checks the project and effective task settings and the local status ledger's Git exclusion. It does not start a worker, send a prompt, or build the app.
+
+For every feature, name the new behavior and the existing behavior that must remain intact. Add the smallest deterministic check that protects each affected path. The first runnable app change must wire its real Windows build and core journey tests into this workflow. At minimum, test a restored chat opening a real file beside the same chat, link resolution after switching projects, and rejection of a path outside its workspace. Use isolated fixtures and separately confirm native UI behavior in the running Windows app.
+
+Missing, skipped, or failed required checks are not a pass. Report the exact commands, results, and tested commit. [GitHub check triage](.omp/AGENTS.md#required-skill-routing) verifies the remote run separately from local checks. The workflow does not enforce a GitHub ruleset by itself. Packaging, signing, publishing, and deployment are not configured and require separate approval.
