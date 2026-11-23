@@ -1,0 +1,15 @@
+# Local coordination and runtime data
+/.omp/STATUS.md
+/.omp/agent/
+/.omp/local/
+
+# Keep personal configuration and credentials out of Git
+.env
+.env.*
+!.env.example
+
+# Generated dependencies and outputs
+node_modules/
+dist/
+target/
+coverage/

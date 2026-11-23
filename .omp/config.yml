@@ -1,0 +1,6 @@
+task:
+  # Keep captured changes for explicit review instead of applying them to the caller's checkout.
+  isolation:
+    apply: false
+  # Wait for the full task call instead of starting workers from a streamed prefix.
+  speculativeLaunch: false
