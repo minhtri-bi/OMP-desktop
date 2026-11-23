@@ -16,6 +16,7 @@ Before work, name the relevant skill in the assignment and read its exact `skill
 | --- | --- |
 | Resolve overlapping routes or an unclear skill choice | `omp-skill-router` |
 | Check OMP RPC, desktop framework, or browser API contracts | `documentation-lookup`; `contract-first` when freezing a shared interface |
+| Track milestone dependencies or check cross-file impact | `project-roadmap` for progress; `graphify-local` for the code graph |
 | Design or review chat, folder, or preview UI | `omp-ui-design-review`; `accessibility` when changing keyboard, focus, or screen-reader behavior |
 | Ship a user-visible feature or extend PR regression checks | `omp-feature-regression-gate`; `tdd` when adding a behavior regression test first |
 | Diagnose an unclear failure or a failed GitHub check | `omp-repro-debugging` for local reproduction; `omp-ci-gate-verify` for evidence from the exact GitHub run |
@@ -25,10 +26,10 @@ Use an allowed installed alternative if a skill is unavailable; record the subst
 
 ## Agent workflow
 
-1. Start from a named commit. Read the canonical `.omp/STATUS.md` in the primary checkout. Record owner, absolute worktree, branch, base SHA, literal `Write` paths, and `Shared` dependencies before editing. Treat overlapping paths case-insensitively on Windows. Stop for an overlapping or ambiguous claim.
-2. Use one sibling Git worktree and branch per implementation task. `git worktree list --porcelain` identifies the primary checkout and linked worktrees. Do not implement in `main`. Explicitly pass these rules, the task contract, and the correct working directory to a delegated subagent; do not assume child context inherits them.
+1. Start from a named commit. Check the primary checkout's existing local `.omp/STATUS.md`, if present, and other claims. Record owner, worktree, branch, base SHA, literal `Write` paths, and `Shared` dependencies. Treat Windows paths case-insensitively. Stop for an overlapping or ambiguous claim. The coordinator tracks feature progress with `project_roadmap` in the dedicated worktree, not in a second progress file.
+2. Use one branch and one linked checkout under the repository's ignored `.worktrees/` directory per implementation task. Verify the path is ignored and unused before creating it. Never implement in `main`. Pass the assignment, checkout path, and these rules to any delegated agent. A Git checkout does not restrict OS permissions.
 3. The integrator owns shared contracts and root build files. Agents do not change them without a separate handoff. Do not start a dependent assignment from an unpublished contract. Keep changes and their focused check together under one owner.
 4. Before handoff, compare committed, staged, unstaged, and untracked paths with the approved scope. Run the task's exact behavior check in its worktree. For desktop UI, include evidence from the running Windows app, not only a build. Report base/head SHAs, changed paths, command and result, and blockers in the canonical status file.
-5. Commit only owned changes. A worker report is not acceptance. The integrator verifies the combined result; only the user authorizes integration, new remotes, or publication. Never use automatic apply, force push, or permission bypass to finish a task.
+5. Commit only verified, owned changes. Push the task branch to the approved origin and open or update one PR against `main` for the project owner. A worker report is not acceptance. Do not push directly to `main`, merge, change repository rules, force-push, or deploy without separate user authorization.
 
 `task` subagents and `ompt` team workers are distinct. A team path reservation coordinates edits; it is not an OS sandbox or a Git worktree. Use the existing OMP approval flow. Do not write custom scripts to submit `/team` commands or approvals. See the root README for dispatch and suggested slices.
