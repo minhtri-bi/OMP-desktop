@@ -1,0 +1,6 @@
+# Normalize line endings across Windows and Linux contributors
+* text=auto eol=lf
+
+# Windows batch scripts require CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf

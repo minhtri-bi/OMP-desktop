@@ -4,3 +4,6 @@ task:
     apply: false
   # Wait for the full task call instead of starting workers from a streamed prefix.
   speculativeLaunch: false
+worktree:
+  # Avoid cloning ignored primary-checkout coordination state (.omp/STATUS.md, .omp/roadmap/) into linked worktrees.
+  clone: false
