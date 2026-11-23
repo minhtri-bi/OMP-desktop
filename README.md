@@ -16,13 +16,15 @@ Match the Antigravity interaction: clicking a filename chip or file link in chat
 - Assign one owner per task with this contract: `Goal | base SHA | branch and absolute worktree | literal write paths | read-only dependencies | primary skill | expected and preserved behavior | exact check`. Follow the [required skill routes](.omp/AGENTS.md#required-skill-routing). New paths need an updated claim before editing.
 - The integrator owns shared interfaces, root build files, and integration. Keep dependent tasks queued until their required contract lands on an agreed base.
 
-From the primary checkout, put each linked worktree under the repository's ignored `.worktrees\` directory. Use an unused path, an agreed base SHA, and a unique task branch. Example when `main` is that base:
+From the primary checkout, put each linked worktree under the repository's ignored `.worktrees\` directory. Use an unused path, an explicit agreed base SHA, and a unique task branch, then launch `omp` from the worktree root (not a subdirectory, because OMP only reads `<cwd>/.omp/config.yml`):
 
 ```powershell
+$baseSha = git rev-parse --verify main
+if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the agreed base SHA.' }
 git check-ignore -- .worktrees/omp-rpc/
 if ($LASTEXITCODE -ne 0) { throw 'The worktree path must be ignored.' }
 if (Test-Path -LiteralPath .worktrees/omp-rpc) { throw 'The worktree path already exists.' }
-git worktree add -b work/omp-rpc .worktrees/omp-rpc main
+git worktree add -b work/omp-rpc .worktrees/omp-rpc $baseSha
 if ($LASTEXITCODE -ne 0) { throw 'Could not create the assigned worktree.' }
 Set-Location .worktrees\omp-rpc
 omp
@@ -56,9 +58,9 @@ These are independent proposals, not active claims. Each agent owns the evidence
 
 | Slice | Candidate write scope | Acceptance |
 | --- | --- | --- |
-| OMP runtime | `docs/decisions/omp-runtime.md` | Probe installed OMP RPC without a paid prompt. Record the version, session/stream/approval surfaces, unsupported operations, and reproducible evidence. |
-| Desktop and browser host | `docs/decisions/browser-host.md` | Compare Windows hosts for the shared preview pane. Explain how to render PDF and interactive local HTML, isolate browser profiles, and keep page content away from app IPC. |
-| Folder and chat workflow | `docs/decisions/workspace-ux.md` | Specify file chips, the side-by-side preview, breadcrumb navigation, tab focus/restore, standalone/project chats, and exact workspace link resolution. |
+| OMP runtime | `docs/decisions/omp-runtime.md` | Probe installed OMP RPC without a paid prompt. Record the version, `--mode rpc` vs `--mode rpc-ui` approval/dialog surfaces, protocol v2 chunking, standalone CWD isolation, Windows child-process cleanup, unsupported operations, and reproducible evidence. |
+| Desktop and browser host | `docs/decisions/browser-host.md` | Compare Windows hosts for the shared preview pane. Explain how to render PDF and interactive local HTML with per-workspace/preview origin isolation, isolate browser profiles, block dangerous URI schemes, handle Windows child-webview airspace/overlays, and keep page content away from app IPC. |
+| Folder and chat workflow | `docs/decisions/workspace-ux.md` | Specify file chips, the side-by-side preview, breadcrumb navigation (including standalone chat's explicit-attachment boundary), case-insensitive tab deduplication/restore, standalone/project chats, and exact Windows path canonicalization (symlinks/junctions, UNC/device paths, prefix collisions, stale links). |
 
 The first integrated path must open a folder and display files from its chat in the right-hand pane. Switching to standalone chat must preserve each chat's own context. Both use the same OMP adapter. Verify this flow in the running Windows app before broadening the surface.
 
@@ -70,10 +72,10 @@ Run the same harness check as CI from PowerShell with `omp` and Git on `PATH`:
 .\scripts\check-harness.ps1
 ```
 
-The [Verify workflow](.github/workflows/verify.yml) runs on Windows for PRs targeting `main`. It verifies the SHA-256 of the pinned OMP release, then checks the project and effective task settings and the local status ledger's Git exclusion. It does not start a worker, send a prompt, or build the app.
+The [Verify workflow](.github/workflows/verify.yml) runs on Windows for PRs targeting `main` and pushes to `main`. It verifies the SHA-256 of the pinned OMP release, then checks the project and effective task/worktree settings (`task.isolation.apply`, `task.speculativeLaunch`, `worktree.clone`), `.gitignore` exclusion of local coordination/worktree/graph/env paths, and that none of those paths are tracked in Git. It does not start a worker, send a prompt, or build the app.
 
 For every feature, name the new behavior and the existing behavior that must remain intact. Add the smallest deterministic check that protects each affected path. The first runnable app change must wire its real Windows build and core journey tests into this workflow. At minimum, test a restored chat opening a real file beside the same chat, link resolution after switching projects, and rejection of a path outside its workspace. Use isolated fixtures and separately confirm native UI behavior in the running Windows app.
 
-After the local check, commit owned changes with OMP's selective commit tool. Push the task branch to the approved `origin`, then open or update one PR targeting `main` with the [review template](.github/pull_request_template.md). The project owner reviews and merges. If `origin/main` does not exist, ask the owner to authorize its initial seed; do not push the task branch first and accidentally set it as the default.
+After the local check, commit owned changes with OMP's selective commit tool (or scoped `git add <owned-paths> && git commit` when local OMP extensions are unavailable). Push the task branch to the approved `origin`, then open or update one PR targeting `main` with the [review template](.github/pull_request_template.md). The project owner reviews and merges. If `origin/main` does not exist, ask the owner to authorize its initial seed; do not push the task branch first and accidentally set it as the default.
 
 Missing, skipped, or failed required checks are not a pass. Report the exact commands, results, and tested commit. [GitHub check triage](.omp/AGENTS.md#required-skill-routing) verifies the remote run separately from local checks. The workflow does not enforce a GitHub ruleset by itself. Packaging, signing, publishing, and deployment are not configured and require separate approval.
