@@ -17,7 +17,6 @@ import type {
 import { OmpRuntimeAdapter } from "./omp-adapter";
 import {
   canonicalizeExistingPath,
-  isPathWithinRoot,
   normalizeForComparison,
   resolveMessageFileLink,
 } from "./path-resolver";
@@ -216,21 +215,54 @@ function initializeFixtureOrDefaultState(): void {
 }
 
 function authorizeFileAccess(canonicalPath: string, owningBinding: ChatWorkspaceBinding): string {
-  const realTarget = canonicalizeExistingPath(canonicalPath);
-  if (owningBinding.kind === "standalone") {
-    const allowed = new Set(
-      owningBinding.attachedCanonicalPaths.map((p) => normalizeForComparison(p)),
+  const resolved = resolveMessageFileLink({
+    chatId: owningBinding.kind === "standalone" ? owningBinding.chatId : owningBinding.workspaceId,
+    messageId: "authorize-read",
+    isRestoredMessage: false,
+    owningBinding,
+    rawTarget: canonicalPath,
+  });
+  if (!resolved.ok || resolved.descriptor.viewerKind === "folder-explorer") {
+    throw new Error(
+      resolved.ok ? "Access denied: target is a directory." : `Access denied (${resolved.code}): ${resolved.message}`,
     );
-    if (!allowed.has(normalizeForComparison(realTarget))) {
-      throw new Error("Access denied: file is outside standalone chat attachments.");
+  }
+  return resolved.descriptor.canonicalPath;
+}
+
+function getOrCreateProjectChat(ws: WorkspaceDescriptor, forceNew = false): ChatThread {
+  if (!forceNew) {
+    for (const existing of chats.values()) {
+      if (
+        existing.owningBinding.kind === "project" &&
+        existing.owningBinding.workspaceId === ws.workspaceId
+      ) {
+        return existing;
+      }
     }
-    return realTarget;
   }
-  const realRoot = canonicalizeExistingPath(owningBinding.workspaceRoot);
-  if (!isPathWithinRoot(realTarget, realRoot)) {
-    throw new Error("Access denied: file escapes owning workspace root.");
-  }
-  return realTarget;
+  const chatId = `chat-${ws.workspaceId}-${chats.size + 1}`;
+  const chat: ChatThread = {
+    chatId,
+    title: `${ws.displayName} Chat`,
+    owningBinding: {
+      kind: "project",
+      workspaceId: ws.workspaceId,
+      workspaceRoot: ws.workspaceRoot,
+      workspaceDisplayName: ws.displayName,
+    },
+    messages: [
+      {
+        messageId: `${chatId}-welcome`,
+        role: "system",
+        isRestoredMessage: false,
+        text: `Project chat bound to ${ws.displayName}. Switching projects in the sidebar will not change this chat's workspace.`,
+      },
+    ],
+    composerDraft: "",
+  };
+  chats.set(chatId, chat);
+  return chat;
 }
 
 function registerIpcHandlers(): void {
@@ -242,34 +274,58 @@ function registerIpcHandlers(): void {
     diagnostics: { ...diagnostics },
   }));
 
-  ipcMain.handle("omp-desktop:open-folder-dialog", async (): Promise<WorkspaceDescriptor | null> => {
-    if (!mainWindow) return null;
-    const result = await dialog.showOpenDialog(mainWindow, {
-      properties: ["openDirectory"],
-      title: "Open Workspace Folder",
-    });
-    if (result.canceled || result.filePaths.length === 0) {
-      return null;
-    }
-    const ws = addWorkspace(result.filePaths[0]!);
-    activeWorkspaceId = ws.workspaceId;
-    return ws;
-  });
+  ipcMain.handle(
+    "omp-desktop:open-folder-dialog",
+    async (): Promise<{ workspace: WorkspaceDescriptor; chat: ChatThread } | null> => {
+      if (!mainWindow) return null;
+      const result = await dialog.showOpenDialog(mainWindow, {
+        properties: ["openDirectory"],
+        title: "Open Workspace Folder",
+      });
+      if (result.canceled || result.filePaths.length === 0) {
+        return null;
+      }
+      const ws = addWorkspace(result.filePaths[0]!);
+      const chat = getOrCreateProjectChat(ws, false);
+      activeWorkspaceId = ws.workspaceId;
+      activeChatId = chat.chatId;
+      return { workspace: ws, chat };
+    },
+  );
+
+  ipcMain.handle(
+    "omp-desktop:create-project-chat",
+    (_event, workspaceId: string): ChatThread | null => {
+      const ws = workspaces.get(workspaceId);
+      if (!ws) return null;
+      const chat = getOrCreateProjectChat(ws, true);
+      activeChatId = chat.chatId;
+      return chat;
+    },
+  );
 
   ipcMain.handle(
     "omp-desktop:list-directory",
     (_event, workspaceRoot: string, relativeDir: string): FolderEntry[] => {
       const realRoot = canonicalizeExistingPath(workspaceRoot);
-      const target = relativeDir
-        ? path.resolve(realRoot, relativeDir.replace(/\\/g, path.sep))
-        : realRoot;
-      if (!isPathWithinRoot(target, realRoot) || !fs.existsSync(target)) {
+      const resolved = relativeDir
+        ? resolveMessageFileLink({
+            chatId: "explorer",
+            messageId: "explorer",
+            isRestoredMessage: false,
+            owningBinding: {
+              kind: "project",
+              workspaceId: "explorer",
+              workspaceRoot: realRoot,
+              workspaceDisplayName: path.basename(realRoot),
+            },
+            rawTarget: relativeDir,
+          })
+        : null;
+      if (resolved && (!resolved.ok || resolved.descriptor.viewerKind !== "folder-explorer")) {
         return [];
       }
-      const realTarget = canonicalizeExistingPath(target);
-      if (!isPathWithinRoot(realTarget, realRoot)) {
-        return [];
-      }
+      const realTarget = resolved && resolved.ok ? resolved.descriptor.canonicalPath : realRoot;
       const entries = fs.readdirSync(realTarget, { withFileTypes: true });
       return entries
         .filter((e) => !e.name.startsWith(".git"))
@@ -479,6 +535,7 @@ function registerIpcHandlers(): void {
                   standaloneCwd,
                 },
           approvalMode: "always-ask",
+          supportsFormDialog: false,
           requireProtocolV2: true,
           shutdownTimeoutMs: 5_000,
         });
@@ -553,12 +610,24 @@ app.whenReady().then(async () => {
   await createMainWindow();
 });
 
-app.on("before-quit", () => {
-  previewManager?.disposeAll();
-  for (const adapter of adaptersByChatId.values()) {
-    void adapter.dispose();
+let quitPhase: "idle" | "disposing" | "ready" = "idle";
+
+app.on("before-quit", (event) => {
+  if (quitPhase === "ready") {
+    return;
   }
+  event.preventDefault();
+  if (quitPhase === "disposing") {
+    return;
+  }
+  quitPhase = "disposing";
+  previewManager?.disposeAll();
+  const activeAdapters = Array.from(adaptersByChatId.values());
   adaptersByChatId.clear();
+  void Promise.allSettled(activeAdapters.map((adapter) => adapter.dispose())).finally(() => {
+    quitPhase = "ready";
+    app.quit();
+  });
 });
 
 app.on("window-all-closed", () => {

@@ -12,6 +12,8 @@ export interface OmpProcessConfig {
   sessionDir?: string;
   agentDirOverride?: string;
   modelOverride?: string;
+  /** Explicit opt-in when the UI implements a safe declarative form renderer; defaults to false (auto-cancel forms). */
+  supportsFormDialog?: boolean;
   requireProtocolV2: true;
   shutdownTimeoutMs: number;
 }
@@ -258,9 +260,15 @@ export interface BootstrapPayload {
   diagnostics: RuntimeDiagnostics;
 }
 
+export interface OpenFolderResult {
+  workspace: WorkspaceDescriptor;
+  chat: ChatThread;
+}
+
 export interface DesktopBridgeApi {
   getBootstrap(): Promise<BootstrapPayload>;
-  openFolderDialog(): Promise<WorkspaceDescriptor | null>;
+  openFolderDialog(): Promise<OpenFolderResult | null>;
+  createProjectChat(workspaceId: string): Promise<ChatThread | null>;
   listDirectory(workspaceRoot: string, relativeDir: string): Promise<FolderEntry[]>;
   resolveAndOpenLink(request: MessageFileLinkRequest): Promise<PathResolutionResult>;
   readSourceFile(canonicalPath: string, owningBinding: ChatWorkspaceBinding): Promise<SourceFileContent>;

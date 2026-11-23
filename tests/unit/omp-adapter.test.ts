@@ -176,11 +176,16 @@ rl.on("close", () => process.exit(0));
       );
 
       const adapter = new OmpRuntimeAdapter();
+      // Register an event forwarder (mirroring Electron main.ts) and confirm form is STILL auto-cancelled when supportsFormDialog is false
+      const observedEvents: OmpAdapterEvent[] = [];
+      adapter.onEvent((ev) => observedEvents.push(ev));
+
       const meta = await adapter.start({
         ompExecutablePath: process.execPath,
         ompArgsPrefix: [script],
         scope: { kind: "standalone", standaloneCwd: path.join(tmp, "standalone") },
         approvalMode: "always-ask",
+        supportsFormDialog: false,
         requireProtocolV2: true,
         shutdownTimeoutMs: 2_000,
       });
@@ -190,6 +195,9 @@ rl.on("close", () => process.exit(0));
       expect(state.sessionId).toBe("sess-1");
       expect(adapter.getRetainedMessages()).toEqual([{ role: "assistant", text: "retained-turn-1" }]);
       expect(adapter.getPromptRequestCount()).toBe(0);
+      expect(
+        observedEvents.some((e) => e.type === "dialog_request" && e.request.method === "form"),
+      ).toBe(false);
 
       await adapter.dispose();
 
@@ -203,6 +211,76 @@ rl.on("close", () => process.exit(0));
           (m) => m.type === "extension_ui_response" && m.id === "form-1" && m.cancelled === true,
         ),
       ).toBe(true);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("tears down child process without leaking when ready omits v2 or negotiate_protocol fails", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "omp-adapter-reject-"));
+    try {
+      const exitMarkerA = path.join(tmp, "exited-a.txt");
+      const scriptNoV2 = writeMockOmpScript(
+        tmp,
+        "fake-omp-v1-only",
+        `
+const fs = require("node:fs");
+process.stdout.write(JSON.stringify({ type: "ready", protocolVersion: 1, supportedProtocolVersions: [1] }) + "\\n");
+process.stdin.resume();
+process.stdin.on("end", () => {
+  fs.writeFileSync(${JSON.stringify(exitMarkerA)}, "exited");
+  process.exit(0);
+});
+        `,
+      );
+
+      const adapterA = new OmpRuntimeAdapter();
+      await expect(
+        adapterA.start({
+          ompExecutablePath: process.execPath,
+          ompArgsPrefix: [scriptNoV2],
+          scope: { kind: "standalone", standaloneCwd: path.join(tmp, "sa-a") },
+          approvalMode: "always-ask",
+          requireProtocolV2: true,
+          shutdownTimeoutMs: 2_000,
+        }),
+      ).rejects.toThrow(/does not advertise RPC protocol v2/i);
+      expect(fs.existsSync(exitMarkerA)).toBe(true);
+
+      const exitMarkerB = path.join(tmp, "exited-b.txt");
+      const scriptRejectNeg = writeMockOmpScript(
+        tmp,
+        "fake-omp-reject-v2",
+        `
+const fs = require("node:fs");
+const readline = require("node:readline");
+process.stdout.write(JSON.stringify({ type: "ready", protocolVersion: 1, supportedProtocolVersions: [1, 2] }) + "\\n");
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.type === "negotiate_protocol") {
+    process.stdout.write(JSON.stringify({ id: msg.id, type: "response", command: "negotiate_protocol", success: false, error: "v2 disabled" }) + "\\n");
+  }
+});
+rl.on("close", () => {
+  fs.writeFileSync(${JSON.stringify(exitMarkerB)}, "exited");
+  process.exit(0);
+});
+        `,
+      );
+
+      const adapterB = new OmpRuntimeAdapter();
+      await expect(
+        adapterB.start({
+          ompExecutablePath: process.execPath,
+          ompArgsPrefix: [scriptRejectNeg],
+          scope: { kind: "standalone", standaloneCwd: path.join(tmp, "sa-b") },
+          approvalMode: "always-ask",
+          requireProtocolV2: true,
+          shutdownTimeoutMs: 2_000,
+        }),
+      ).rejects.toThrow(/v2 negotiation failed/i);
+      expect(fs.existsSync(exitMarkerB)).toBe(true);
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }

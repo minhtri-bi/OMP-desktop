@@ -96,6 +96,17 @@ export class PdfPreviewController {
     }
   }
 
+  private clearCanvas(): void {
+    const ctx = this.canvas.getContext("2d");
+    if (ctx && this.canvas.width > 0 && this.canvas.height > 0) {
+      ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+    }
+    this.canvas.width = 0;
+    this.canvas.height = 0;
+    this.canvas.style.width = "";
+    this.canvas.style.height = "";
+  }
+
   async destroy(): Promise<void> {
     if (this.activeRenderTask) {
       try {
@@ -113,5 +124,6 @@ export class PdfPreviewController {
       await this.loadingTask.destroy();
       this.loadingTask = null;
     }
+    this.clearCanvas();
   }
 }

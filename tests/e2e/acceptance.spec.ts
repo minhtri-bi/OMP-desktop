@@ -57,6 +57,7 @@ test.beforeAll(async () => {
   // Dynamically create a symlink (or Windows directory junction) inside workspace-a pointing outside workspace-a
   const wsA = path.join(fixtureCopyRoot, "workspace-a");
   const outsideDir = path.join(fixtureCopyRoot, "outside-workspace");
+  fs.writeFileSync(path.join(wsA, "docs", "corrupt.pdf"), "NOT_A_VALID_PDF_HEADER\n", "utf8");
   try {
     fs.symlinkSync(path.join(outsideDir, "secret.txt"), path.join(wsA, "escaped-link.txt"), "file");
     symlinkRelativeTarget = "escaped-link.txt";
@@ -194,12 +195,48 @@ test("ACC-01..ACC-08: real click-to-preview journey, project switching, standalo
     const children = (win?.contentView.children ?? []) as Array<{ webContents?: Electron.WebContents }>;
     const previewView = children.find((c) => c.webContents?.getURL().startsWith("omp-preview://"));
     if (!previewView?.webContents) throw new Error("Missing preview view");
-    return previewView.webContents.executeJavaScript(
+    const fetchResult = await previewView.webContents.executeJavaScript(
       `fetch(${JSON.stringify(targetProbeUrl)}).then((r) => r.text(), () => 'blocked')`,
     );
+    const notifPerm = await previewView.webContents.executeJavaScript(
+      `typeof Notification !== 'undefined' ? Notification.requestPermission() : 'denied'`,
+    );
+    return { fetchResult, notifPerm };
   }, probeUrl);
-  expect(allowedFetch).toBe("probe-ok");
+  expect(allowedFetch.fetchResult).toBe("probe-ok");
+  expect(allowedFetch.notifPerm).toBe("denied");
   expect(probeServerHits).toBe(1);
+
+  // Regression: opening and closing breadcrumb popover on an HTML preview restores the isolated WebContentsView
+  await page.getByTestId("breadcrumb-browsable-0").click();
+  await expect(page.getByTestId("breadcrumb-siblings")).toBeVisible();
+  await page.getByTestId("breadcrumb-browsable-0").click();
+  await expect(page.getByTestId("breadcrumb-siblings")).toBeHidden();
+  await expect(page.getByTestId("isolated-view-host")).toHaveAttribute("data-view-ready", "true");
+  const htmlViewVisibleAfterBreadcrumb = await electronApp.evaluate(({ BrowserWindow }) => {
+    const win = BrowserWindow.getAllWindows()[0];
+    const children = (win?.contentView.children ?? []) as Array<{
+      webContents?: Electron.WebContents;
+      getVisible?: () => boolean;
+      getBounds?: () => { width: number; height: number };
+    }>;
+    const previewView = children.find((c) => c.webContents?.getURL().startsWith("omp-preview://"));
+    return {
+      visible: previewView?.getVisible?.() ?? false,
+      width: previewView?.getBounds?.().width ?? 0,
+    };
+  });
+  expect(htmlViewVisibleAfterBreadcrumb.visible).toBe(true);
+  expect(htmlViewVisibleAfterBreadcrumb.width).toBeGreaterThan(100);
+
+  // Regression: opening a corrupt PDF after a valid PDF clears the previous canvas and reports PDF_LOAD_ERROR
+  await page.getByTestId("tree-entry-docs/corrupt.pdf").click();
+  await expect(page.getByTestId("link-error-code")).toHaveText("PDF_LOAD_ERROR");
+  await expect(page.getByTestId("pdf-viewer")).toBeHidden();
+  const corruptCanvasWidth = await page
+    .getByTestId("pdf-canvas")
+    .evaluate((el) => (el as HTMLCanvasElement).width);
+  expect(corruptCanvasWidth).toBe(0);
 
   // ACC-04: Switch visible project sidebar to Workspace B -> restored Workspace A chat links STILL resolve to Workspace A
   await page.getByTestId("workspace-item-ws-fixture-b").click();
@@ -209,6 +246,14 @@ test("ACC-01..ACC-08: real click-to-preview journey, project switching, standalo
   await page.getByTestId("chat-link-link-source").click();
   await expect(page.getByTestId("source-viewer")).toContainText("WORKSPACE_A_HELLO_TS");
   await expect(page.getByTestId("source-viewer")).not.toContainText("WORKSPACE_B_MARKER");
+
+  // Regression: creating a project chat for Workspace B binds to Workspace B without mutating Workspace A's chat
+  const createdWsBChat = await page.evaluate(() => window.ompDesktop.createProjectChat("ws-fixture-b"));
+  expect(createdWsBChat?.owningBinding.kind).toBe("project");
+  if (createdWsBChat?.owningBinding.kind === "project") {
+    expect(createdWsBChat.owningBinding.workspaceId).toBe("ws-fixture-b");
+  }
+  await expect(page.getByTestId("active-chat-scope")).toHaveText("Workspace: workspace-a");
 
   // ACC-06 & ACC-07: Stale link, traversal, prefix collision, symlink/junction escape, UNC, ADS, reserved DOS name
   const tabCountBeforeBadLinks = await page.getByTestId("preview-tab-item").count();
@@ -235,9 +280,11 @@ test("ACC-01..ACC-08: real click-to-preview journey, project switching, standalo
   expect(bodyText).not.toContain("OUTSIDE_WORKSPACE_SENTINEL_DO_NOT_OPEN");
   expect(bodyText).not.toContain("PREFIX_COLLISION_SENTINEL_DO_NOT_OPEN");
 
-  // ACC-05: Switch to Standalone chat -> preserves independent context, opens attached file without parent browsing, rejects unattached path
+  // ACC-05: Switch to Standalone chat -> preserves independent context & draft, opens attached file without parent browsing, rejects unattached path
   await page.getByTestId("chat-item-chat-standalone-default").click();
   await expect(page.getByTestId("active-chat-scope")).toHaveText("Standalone (no project folder)");
+  await page.getByTestId("composer-input").fill("Summarize this attached file");
+  await expect(page.getByTestId("composer-input")).toHaveValue("Summarize this attached file");
 
   await page.getByTestId("chat-link-standalone-attached-link").click();
   await expect(page.getByTestId("source-viewer")).toBeVisible();
@@ -250,9 +297,12 @@ test("ACC-01..ACC-08: real click-to-preview journey, project switching, standalo
   await expect(page.getByTestId("link-error-code")).toHaveText("UNATTACHED_STANDALONE_PATH");
   await expect(page.getByTestId("preview-tab-item")).toHaveCount(tabsBeforeUnattached);
 
-  // Return to Workspace A chat and verify its scope and restored transcript remain intact
+  // Return to Workspace A chat and back to Standalone to verify draft and bindings remain intact
   await page.getByTestId("chat-item-chat-restored-workspace-a-001").click();
   await expect(page.getByTestId("active-chat-scope")).toHaveText("Workspace: workspace-a");
+  await page.getByTestId("chat-item-chat-standalone-default").click();
+  await expect(page.getByTestId("composer-input")).toHaveValue("Summarize this attached file");
+  await page.getByTestId("chat-item-chat-restored-workspace-a-001").click();
 
   // ACC-08: Verify previewing files never triggered any prompt or implicit attachment to OMP
   const diagnostics = await page.evaluate(() => window.ompDesktop.getDiagnostics());

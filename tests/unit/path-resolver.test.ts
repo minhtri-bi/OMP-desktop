@@ -5,6 +5,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   buildPreviewTabKey,
   canonicalizeExistingPath,
+  isPathWithinRoot,
   resolveMessageFileLink,
   resolvePreviewSubresource,
   validatePathSyntax,
@@ -272,5 +273,62 @@ describe("path-resolver (Windows-first canonicalization & isolation)", () => {
     const siblingBlocked = resolvePreviewSubresource(path.dirname(singleFile), "/other.js", singleFile);
     expect(siblingBlocked.ok).toBe(false);
     if (!siblingBlocked.ok) expect(siblingBlocked.statusCode).toBe(403);
+  });
+
+  it("enforces strict case-sensitive canonical containment so differing-case sibling directories cannot bypass isolation", () => {
+    expect(isPathWithinRoot("/tmp/Workspace-A/secret.txt", "/tmp/workspace-a")).toBe(false);
+    expect(isPathWithinRoot("C:\\Work\\App\\secret.txt", "C:\\Work\\app")).toBe(false);
+    expect(isPathWithinRoot("c:\\work\\app\\file.txt", "C:\\work\\app")).toBe(true);
+
+    if (process.platform !== "win32") {
+      const upperSibling = path.join(tempDir, "Workspace-A");
+      fs.mkdirSync(upperSibling, { recursive: true });
+      fs.writeFileSync(path.join(upperSibling, "case-secret.txt"), "CASE_SECRET");
+      const caseLink = path.join(wsA, "case-escape.txt");
+      fs.symlinkSync(path.join(upperSibling, "case-secret.txt"), caseLink, "file");
+
+      const linkRes = resolveMessageFileLink({
+        chatId: "chat-1",
+        messageId: "msg-case",
+        isRestoredMessage: false,
+        owningBinding: bindingA,
+        rawTarget: "case-escape.txt",
+      });
+      expect(linkRes.ok).toBe(false);
+      if (!linkRes.ok) expect(linkRes.code).toBe("OUT_OF_WORKSPACE");
+
+      const subRes = resolvePreviewSubresource(canonicalizeExistingPath(wsA), "/case-escape.txt");
+      expect(subRes.ok).toBe(false);
+      if (!subRes.ok) expect(subRes.statusCode).toBe(403);
+    }
+  });
+
+  it("rejects workspace symlinks targeting UNC shares via lstat/readlink without contacting the share", () => {
+    const uncLinkName = "unc-share-link.txt";
+    const uncLinkPath = path.join(wsA, uncLinkName);
+    let created = false;
+    try {
+      fs.symlinkSync("\\\\192.0.2.1\\share\\secret.txt", uncLinkPath, "file");
+      created = true;
+    } catch {
+      // Unprivileged Windows environments without SeCreateSymbolicLinkPrivilege cannot create file symlinks;
+      // direct UNC syntax rejection is still covered above.
+    }
+
+    if (created) {
+      const linkRes = resolveMessageFileLink({
+        chatId: "chat-1",
+        messageId: "msg-unc-sym",
+        isRestoredMessage: false,
+        owningBinding: bindingA,
+        rawTarget: uncLinkName,
+      });
+      expect(linkRes.ok).toBe(false);
+      if (!linkRes.ok) expect(linkRes.code).toBe("UNSAFE_PATH_SYNTAX");
+
+      const subRes = resolvePreviewSubresource(canonicalizeExistingPath(wsA), `/${uncLinkName}`);
+      expect(subRes.ok).toBe(false);
+      if (!subRes.ok) expect(subRes.statusCode).toBe(403);
+    }
   });
 });

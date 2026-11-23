@@ -516,7 +516,7 @@ async function toggleBreadcrumbSiblings(
 ): Promise<void> {
   if (!breadcrumbSiblingsEl.classList.contains("hidden")) {
     hideSiblingPopover();
-    await syncActiveIsolatedViewBounds();
+    await activateTab(activeTabKey);
     return;
   }
 
@@ -789,13 +789,26 @@ async function activateTab(tabKey: string | null): Promise<void> {
     await api.hideIsolatedViews();
     sourceViewerEl.classList.add("hidden");
     isolatedViewHostEl.classList.add("hidden");
-    pdfViewerEl.classList.remove("hidden");
+    pdfViewerEl.classList.add("hidden");
+    await pdfController.destroy();
     if (tab.pdfBytes) {
-      const state = await pdfController.loadBytes(tab.pdfBytes.slice());
-      tab.pdfPage = state.currentPage;
-      tab.pdfTotalPages = state.totalPages;
-      tab.pdfZoom = state.zoom;
-      renderToolbar(tab);
+      try {
+        const state = await pdfController.loadBytes(tab.pdfBytes.slice());
+        tab.pdfPage = state.currentPage;
+        tab.pdfTotalPages = state.totalPages;
+        tab.pdfZoom = state.zoom;
+        pdfViewerEl.classList.remove("hidden");
+        renderToolbar(tab);
+      } catch (err) {
+        await pdfController.destroy();
+        tab.pdfPage = 0;
+        tab.pdfTotalPages = 0;
+        renderToolbar(tab);
+        showError(
+          "PDF_LOAD_ERROR",
+          `Could not render PDF "${tab.title}": ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     }
     return;
   }
@@ -842,13 +855,25 @@ async function closeTab(tabKey: string): Promise<void> {
 dismissErrorBtn.addEventListener("click", () => clearError());
 
 openFolderBtn.addEventListener("click", async () => {
-  const ws = await api.openFolderDialog();
-  if (!ws) return;
+  const opened = await api.openFolderDialog();
+  if (!opened) return;
+  const { workspace: ws, chat } = opened;
   if (!workspaces.some((w) => w.workspaceId === ws.workspaceId)) {
     workspaces.push(ws);
   }
+  if (!chats.some((c) => c.chatId === chat.chatId)) {
+    chats.push(chat);
+  }
+  const current = getActiveChat();
+  if (current) {
+    current.composerDraft = composerInput.value;
+  }
   activeWorkspaceId = ws.workspaceId;
+  activeChatId = chat.chatId;
+  clearError();
   renderWorkspaces();
+  renderChatList();
+  renderActiveChat();
   await renderFileTree();
 });
 
@@ -859,12 +884,20 @@ newBrowserTabBtn.addEventListener("click", async () => {
 attachStandaloneBtn.addEventListener("click", async () => {
   const chat = getActiveChat();
   if (!chat || chat.owningBinding.kind !== "standalone") return;
+  chat.composerDraft = composerInput.value;
   const attachedPath = await api.attachStandaloneFileDialog(chat.chatId);
   if (!attachedPath) return;
   if (!chat.owningBinding.attachedCanonicalPaths.includes(attachedPath)) {
     chat.owningBinding.attachedCanonicalPaths.push(attachedPath);
   }
   renderActiveChat();
+});
+
+composerInput.addEventListener("input", () => {
+  const chat = getActiveChat();
+  if (chat) {
+    chat.composerDraft = composerInput.value;
+  }
 });
 
 composerForm.addEventListener("submit", async (ev) => {

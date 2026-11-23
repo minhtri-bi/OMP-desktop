@@ -72,9 +72,19 @@ export class IsolatedPreviewManager {
     // Dedicated persistent profile for visible browser tabs (never shares shell or personal browser profile)
     this.browserSession = session.fromPartition("persist:omp-browser-default");
 
+    this.installPermissionDenial(this.previewSession);
+    this.installPermissionDenial(this.browserSession);
     this.installProtocolHandler();
     this.installNetworkGuard(this.previewSession, "html-preview");
     this.installNetworkGuard(this.browserSession, "browser");
+  }
+
+  private installPermissionDenial(targetSession: Session): void {
+    targetSession.setPermissionRequestHandler((_webContents, _permission, callback) => {
+      callback(false);
+    });
+    targetSession.setPermissionCheckHandler(() => false);
+    targetSession.setDevicePermissionHandler(() => false);
   }
 
   private installProtocolHandler(): void {
