@@ -103,7 +103,7 @@ describe("link-parser (live OMP reply file/URL link extraction)", () => {
   it("filters out shell commands and option/assignment tokens while preserving valid filenames", () => {
     const text = [
       "Run `cat README.md`, `git diff src/app.ts`, `node scripts/build.mjs`, `./run.sh README.md`, `--config=app.json`, `-c=app.json`, or `CONFIG=app.json`.",
-      "Do keep `docs/R&D.md`, `-notes.md`, `-notes v2.md`, `docs/config=v2.json`, `docs/Bob's Notes.md`, and `docs/R&D Notes.md#L2`.",
+      "Do keep `docs/R&D.md`, `-notes.md`, `-notes v2.md`, `docs/config=v2.json`, `config=prod/settings.json#L12`, `docs/Bob's Notes.md`, and `docs/R&D Notes.md#L2`.",
     ].join("\n");
 
     const links = parseReplyLinks(text, "msg-5");
@@ -112,21 +112,28 @@ describe("link-parser (live OMP reply file/URL link extraction)", () => {
       { label: "-notes.md", rawTarget: "-notes.md", anchor: undefined },
       { label: "-notes v2.md", rawTarget: "-notes v2.md", anchor: undefined },
       { label: "docs/config=v2.json", rawTarget: "docs/config=v2.json", anchor: undefined },
+      {
+        label: "config=prod/settings.json#L12",
+        rawTarget: "config=prod/settings.json",
+        anchor: { startLine: 12 },
+      },
       { label: "docs/Bob's Notes.md", rawTarget: "docs/Bob's Notes.md", anchor: undefined },
       { label: "docs/R&D Notes.md#L2", rawTarget: "docs/R&D Notes.md", anchor: { startLine: 2 } },
     ]);
   });
 
-  it("supports spaced filenames containing brackets while recovering from malformed destinations before a real link", () => {
+  it("supports spaced filenames containing brackets while recovering from malformed destinations before a real link or backtick citation", () => {
     const text = [
       "Open [Release](docs/Release [Draft].md#L2-L4) for notes.",
       "Malformed [broken](see [real](src/hello.ts#L5) on the same line.",
+      "Malformed [release notes](draft [v2]: `docs/changelog.md` and docs/upgrade.md) keeps citation.",
     ].join("\n");
 
     const links = parseReplyLinks(text, "msg-6");
     expect(links.map((l) => ({ label: l.label, rawTarget: l.rawTarget, anchor: l.anchor }))).toEqual([
       { label: "Release", rawTarget: "docs/Release [Draft].md", anchor: { startLine: 2, endLine: 4 } },
       { label: "real", rawTarget: "src/hello.ts", anchor: { startLine: 5 } },
+      { label: "docs/changelog.md", rawTarget: "docs/changelog.md", anchor: undefined },
     ]);
   });
 });

@@ -247,7 +247,7 @@ function looksLikeCommandSpan(multiwordToken: string): boolean {
 }
 
 function isPlausibleSpacedBareMarkdownPath(rawTarget: string): boolean {
-  if (looksLikeCommandSpan(rawTarget)) {
+  if (rawTarget.includes("`") || looksLikeCommandSpan(rawTarget)) {
     return false;
   }
   return RECOGNIZED_EXT_RE.test(rawTarget) || EXPLICIT_PATH_PREFIX_RE.test(rawTarget);
@@ -555,25 +555,25 @@ export function parseReplyLinks(text: string, messageId: string): ChatLinkItem[]
     if (!token || EXTERNAL_URL_RE.test(token) || BLOCKED_SCHEMES_RE.test(token)) {
       continue;
     }
+    const parsed = parseDestination(token, false);
+    if (!parsed || parsed.kind !== "file" || !RECOGNIZED_EXT_RE.test(parsed.rawTarget)) {
+      continue;
+    }
+
     const hasWhitespace = /\s/.test(token);
     if (hasWhitespace) {
       if (looksLikeCommandSpan(token)) {
         continue;
       }
+    } else if (SINGLE_TOKEN_SHELL_CHAIN_RE.test(token)) {
+      continue;
     } else if (
-      SINGLE_TOKEN_SHELL_CHAIN_RE.test(token) ||
-      SINGLE_TOKEN_OPTION_ASSIGN_RE.test(token)
+      SINGLE_TOKEN_OPTION_ASSIGN_RE.test(token) &&
+      (token.startsWith("-") || parsed.anchor === undefined)
     ) {
       continue;
     }
 
-    const parsed = parseDestination(token, false);
-    if (!parsed || parsed.kind !== "file") {
-      continue;
-    }
-    if (!RECOGNIZED_EXT_RE.test(parsed.rawTarget)) {
-      continue;
-    }
     pushUnique(token, parsed);
   }
 
