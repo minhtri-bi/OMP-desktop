@@ -358,6 +358,39 @@ describe("path-resolver (Windows-first canonicalization & isolation)", () => {
       const authorized = authorizeCanonicalReadPath(resolved.descriptor.canonicalPath, colonBinding);
       expect(authorized).toBe(canonicalizeExistingPath(readmePath));
     }
+
+    // End-to-end POSIX symlink into a workspace subfolder with a colon -> encoded preview URL -> subresource served
+    const subColonDir = path.join(wsA, "release:2026");
+    fs.mkdirSync(subColonDir, { recursive: true });
+    const htmlInColon = path.join(subColonDir, "index.html");
+    fs.writeFileSync(htmlInColon, "<h1>Release 2026 Preview</h1>", "utf8");
+    const symHtml = path.join(wsA, "colon-preview.html");
+    fs.symlinkSync(path.join("release:2026", "index.html"), symHtml, "file");
+
+    const symResolved = resolveMessageFileLink({
+      chatId: "chat-1",
+      messageId: "m-colon-sym",
+      isRestoredMessage: false,
+      owningBinding: bindingA,
+      rawTarget: "colon-preview.html",
+    });
+    expect(symResolved.ok).toBe(true);
+    if (symResolved.ok) {
+      expect(symResolved.descriptor.viewerKind).toBe("html-isolated-browser");
+      const relUrl =
+        "/" +
+        path
+          .relative(canonicalizeExistingPath(wsA), symResolved.descriptor.canonicalPath)
+          .split(path.sep)
+          .map((seg) => encodeURIComponent(seg))
+          .join("/");
+      expect(relUrl).toBe("/release%3A2026/index.html");
+      const served = resolvePreviewSubresource(canonicalizeExistingPath(wsA), relUrl);
+      expect(served.ok).toBe(true);
+      if (served.ok) {
+        expect(served.canonicalPath).toBe(canonicalizeExistingPath(htmlInColon));
+      }
+    }
   });
 
   it("does not treat literal backslashes on POSIX as path separators and rejects root symlink swaps", () => {

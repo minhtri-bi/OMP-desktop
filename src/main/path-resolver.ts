@@ -670,6 +670,52 @@ export function resolveMessageFileLink(request: MessageFileLinkRequest): PathRes
   return { ok: true, descriptor };
 }
 
+function validatePreviewRelativePath(
+  trimmed: string,
+): { ok: true; cleanedTarget: string } | { ok: false; reason: string } {
+  if (!trimmed) {
+    return { ok: false, reason: "Preview path is empty." };
+  }
+  if (/[\x00-\x1f]/.test(trimmed)) {
+    return { ok: false, reason: "Preview path contains control or NUL characters." };
+  }
+  if (trimmed.startsWith("\\\\") || trimmed.startsWith("//")) {
+    return { ok: false, reason: "UNC, extended, and device paths are blocked." };
+  }
+
+  if (process.platform === "win32") {
+    if (trimmed.startsWith("\\") || trimmed.includes(":")) {
+      return {
+        ok: false,
+        reason: "Drive letters, drive-relative paths, and ADS syntax are blocked in preview URLs.",
+      };
+    }
+    const segments = trimmed.split(/[\\/]+/).filter(Boolean);
+    for (const seg of segments) {
+      if (seg === "..") {
+        return { ok: false, reason: "Parent traversal is blocked in preview URLs." };
+      }
+      const stripped = seg.replace(/[. ]+$/, "");
+      const baseName = stripped.split(".")[0] ?? "";
+      if (RESERVED_DOS_NAME_RE.test(baseName)) {
+        return { ok: false, reason: `Reserved Windows device name "${seg}" is blocked.` };
+      }
+    }
+    return { ok: true, cleanedTarget: trimmed.replace(/\\/g, path.sep) };
+  }
+
+  // On POSIX, colons and other legal filename characters are allowed inside workspace-relative
+  // preview URLs (such as symlink targets into a `release:2026` subfolder), while parent traversal
+  // segments ("..") and literal backslash separator coercion remain blocked.
+  const segments = trimmed.split("/").filter(Boolean);
+  for (const seg of segments) {
+    if (seg === "..") {
+      return { ok: false, reason: "Parent traversal is blocked in preview URLs." };
+    }
+  }
+  return { ok: true, cleanedTarget: trimmed };
+}
+
 export function resolvePreviewSubresource(
   canonicalScopeRoot: string,
   relativeUrlPath: string,
@@ -683,7 +729,7 @@ export function resolvePreviewSubresource(
   }
 
   const trimmed = decodedPath.replace(/^\/+/, "");
-  const syntax = validatePathSyntax(trimmed);
+  const syntax = validatePreviewRelativePath(trimmed);
   if (!syntax.ok) {
     return { ok: false, statusCode: 403, reason: syntax.reason };
   }
@@ -725,7 +771,7 @@ export function resolvePreviewSubresource(
     return { ok: true, canonicalPath: real };
   }
 
-  const candidate = path.resolve(canonicalScopeRoot, syntax.cleanedTarget.replace(/\\/g, path.sep));
+  const candidate = path.resolve(canonicalScopeRoot, syntax.cleanedTarget);
   const walked = safeWalkWithinCanonicalRoot(canonicalScopeRoot, candidate);
   if (!walked.ok) {
     return {

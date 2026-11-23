@@ -324,7 +324,11 @@ test("Open Folder creates a bound project chat and displays OMP replies via onOm
   const stubUserData = path.join(stubDir, "user-data");
   fs.mkdirSync(openedFolder, { recursive: true });
   fs.mkdirSync(stubUserData, { recursive: true });
-  fs.writeFileSync(path.join(openedFolder, "README.md"), "# Opened Project\n", "utf8");
+  fs.writeFileSync(
+    path.join(openedFolder, "README.md"),
+    "# Opened Project\nLine 2 highlighted target\nLine 3 highlighted target\nLine 4 tail\n",
+    "utf8",
+  );
 
   const mockOmpScript = path.join(stubDir, "mock-omp.cjs");
   fs.writeFileSync(
@@ -351,7 +355,12 @@ rl.on("line", (line) => {
       type: "message_end",
       message: {
         role: "assistant",
-        content: [{ type: "text", text: "Reply from OMP in " + process.cwd() + ": " + msg.message }],
+        content: [
+          {
+            type: "text",
+            text: "Reply from OMP in " + process.cwd() + ": " + msg.message + " — inspect [readme-lines](README.md#L2-L3).",
+          },
+        ],
       },
     });
     send({ type: "prompt_result", id: msg.id, agentInvoked: true, status: "completed", sessionSettled: true });
@@ -397,6 +406,18 @@ rl.on("close", () => process.exit(0));
     await expect(win2.getByTestId("chat-transcript")).toContainText("Reply from OMP in");
     await expect(win2.getByTestId("chat-transcript")).toContainText("opened-project");
     await expect(win2.getByTestId("chat-transcript")).toContainText("ping-new-folder");
+
+    // Verify Markdown file link inside the live reply became a clickable chip with preserved line anchor
+    const replyChip = win2.getByRole("button", { name: "readme-lines" });
+    await expect(replyChip).toBeVisible();
+    await expect(replyChip).toHaveAttribute("title", "README.md#L2-L3");
+    await replyChip.click();
+
+    await expect(win2.getByTestId("source-viewer")).toBeVisible();
+    await expect(win2.getByTestId("source-viewer")).toContainText("Line 2 highlighted target");
+    await expect(win2.locator('.source-line[data-line="2"]')).toHaveClass(/highlighted/);
+    await expect(win2.locator('.source-line[data-line="3"]')).toHaveClass(/highlighted/);
+    await expect(win2.locator(".source-line.highlighted")).toHaveCount(2);
   } finally {
     await app2.close();
     fs.rmSync(stubDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 150 });

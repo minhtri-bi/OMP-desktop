@@ -9,6 +9,7 @@ import type {
   SourceFileContent,
   WorkspaceDescriptor,
 } from "../shared/contracts";
+import { parseReplyLinks } from "../shared/link-parser";
 import { PdfPreviewController } from "./pdf-viewer";
 
 declare global {
@@ -982,10 +983,13 @@ function handleIncomingOmpEvent(payload: { chatId: string; event: import("../sha
   if (event.type === "message_end" && targetChat) {
     const extracted = extractAssistantText(event.message);
     if (extracted) {
+      const messageId = `omp-${Date.now()}-${targetChat.messages.length}`;
+      const parsedLinks = parseReplyLinks(extracted.text, messageId);
       targetChat.messages.push({
-        messageId: `omp-${Date.now()}-${targetChat.messages.length}`,
+        messageId,
         role: extracted.role,
         text: extracted.text,
+        links: parsedLinks.length > 0 ? parsedLinks : undefined,
         isRestoredMessage: false,
       });
       if (chatId === activeChatId) {
