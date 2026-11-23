@@ -322,11 +322,16 @@ test("Open Folder creates a bound project chat and displays OMP replies via onOm
   const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-desktop-e2e-omp-"));
   const openedFolder = path.join(stubDir, "opened-project");
   const stubUserData = path.join(stubDir, "user-data");
-  fs.mkdirSync(openedFolder, { recursive: true });
+  fs.mkdirSync(path.join(openedFolder, "docs"), { recursive: true });
   fs.mkdirSync(stubUserData, { recursive: true });
   fs.writeFileSync(
     path.join(openedFolder, "README.md"),
     "# Opened Project\nLine 2 highlighted target\nLine 3 highlighted target\nLine 4 tail\n",
+    "utf8",
+  );
+  fs.writeFileSync(
+    path.join(openedFolder, "docs", "User Guide.md"),
+    "# User Guide\nSpaced file line 2 target\nLine 3\n",
     "utf8",
   );
 
@@ -358,7 +363,8 @@ rl.on("line", (line) => {
         content: [
           {
             type: "text",
-            text: "Reply from OMP in " + process.cwd() + ": " + msg.message + " — inspect [readme-lines](README.md#L2-L3).",
+            text: "Reply from OMP in " + process.cwd() + ": " + msg.message +
+              " — inspect [readme-lines](README.md#L2-L3), [user-guide](docs/User%20Guide.md#L2), and [README.md](https://evil.example/phish).",
           },
         ],
       },
@@ -418,6 +424,23 @@ rl.on("close", () => process.exit(0));
     await expect(win2.locator('.source-line[data-line="2"]')).toHaveClass(/highlighted/);
     await expect(win2.locator('.source-line[data-line="3"]')).toHaveClass(/highlighted/);
     await expect(win2.locator(".source-line.highlighted")).toHaveCount(2);
+
+    // Verify percent-encoded spaced Markdown link resolves to the real spaced file and highlights line 2
+    const spacedChip = win2.getByRole("button", { name: "user-guide" });
+    await expect(spacedChip).toHaveAttribute("title", "docs/User Guide.md#L2");
+    await spacedChip.click();
+    await expect(win2.getByTestId("source-viewer")).toContainText("Spaced file line 2 target");
+    await expect(win2.locator('.source-line[data-line="2"]')).toHaveClass(/highlighted/);
+
+    // Verify external web link labeled as a filename is visually distinguished as an external URL chip
+    const externalChip = win2.locator('button.external-url-chip[data-link-kind="external-url"]');
+    await expect(externalChip).toHaveCount(1);
+    await expect(externalChip).toContainText("WEB");
+    await expect(externalChip).toContainText("evil.example");
+    await expect(externalChip).toHaveAttribute(
+      "title",
+      "External URL (evil.example): https://evil.example/phish",
+    );
   } finally {
     await app2.close();
     fs.rmSync(stubDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 150 });

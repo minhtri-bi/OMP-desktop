@@ -297,15 +297,42 @@ function renderActiveChat(): void {
       const chipList = document.createElement("div");
       chipList.className = "chip-list";
       for (const link of msg.links) {
+        const isExternalUrl = link.kind === "external-url" || /^https?:\/\//i.test(link.rawTarget);
         const chip = document.createElement("button");
         chip.type = "button";
-        chip.className = "file-chip";
+        chip.className = isExternalUrl ? "file-chip external-url-chip" : "file-chip";
         chip.dataset.testid = `chat-link-${link.id}`;
-        // Untrusted-link protection: expose true target in tooltip so deceptive labels cannot disguise path
-        chip.title = link.anchor
-          ? `${link.rawTarget}#L${link.anchor.startLine}${link.anchor.endLine ? `-L${link.anchor.endLine}` : ""}`
-          : link.rawTarget;
-        chip.textContent = link.label;
+        chip.dataset.linkKind = isExternalUrl ? "external-url" : "file";
+
+        if (isExternalUrl) {
+          let hostLabel = link.rawTarget;
+          try {
+            hostLabel = new URL(link.rawTarget).host || link.rawTarget;
+          } catch {
+            // keep rawTarget fallback
+          }
+          // Untrusted-link protection: external web links MUST be visually distinguished from local file chips
+          chip.title = `External URL (${hostLabel}): ${link.rawTarget}`;
+
+          const badgeEl = document.createElement("span");
+          badgeEl.className = "chip-badge";
+          badgeEl.textContent = "WEB";
+
+          const labelEl = document.createElement("span");
+          labelEl.textContent = link.label;
+
+          const hostEl = document.createElement("span");
+          hostEl.className = "chip-host";
+          hostEl.textContent = hostLabel;
+
+          chip.append(badgeEl, labelEl, hostEl);
+        } else {
+          // Untrusted-link protection: expose true target in tooltip so deceptive labels cannot disguise path
+          chip.title = link.anchor
+            ? `${link.rawTarget}#L${link.anchor.startLine}${link.anchor.endLine ? `-L${link.anchor.endLine}` : ""}`
+            : link.rawTarget;
+          chip.textContent = link.label;
+        }
 
         chip.addEventListener("click", async () => {
           await handleChatLinkClick(chat, msg.messageId, msg.isRestoredMessage, link);
