@@ -60,22 +60,25 @@ describe("link-parser (live OMP reply file/URL link extraction)", () => {
     ]);
   });
 
-  it("handles deduplication and parenthesized filenames including leading and nested pairs", () => {
+  it("handles parenthesized filenames including Windows separators, escaped parens, leading and nested pairs", () => {
     const text = [
       "Check [v2](docs/spec(v2).pdf) and again [same](docs/spec(v2).pdf) plus `docs/spec(v2).pdf`.",
-      "Also check [draft]((draft).md) and [nested](docs/Spec(v1(a)).md#L2-L4).",
+      "Also check [draft]((draft).md), [nested](docs/Spec(v1(a)).md#L2-L4), [win](docs\\(draft).md#L3), and [esc](docs/spec\\(v2\\).md).",
     ].join("\n");
     const links = parseReplyLinks(text, "msg-3");
     expect(links.map((l) => ({ label: l.label, rawTarget: l.rawTarget, anchor: l.anchor }))).toEqual([
       { label: "v2", rawTarget: "docs/spec(v2).pdf", anchor: undefined },
       { label: "draft", rawTarget: "(draft).md", anchor: undefined },
       { label: "nested", rawTarget: "docs/Spec(v1(a)).md", anchor: { startLine: 2, endLine: 4 } },
+      { label: "win", rawTarget: "docs\\(draft).md", anchor: { startLine: 3 } },
+      { label: "esc", rawTarget: "docs/spec(v2).md", anchor: undefined },
     ]);
   });
 
-  it("decodes percent-encoded Markdown file links once while preserving file:// URIs and literal backtick paths with spaces", () => {
+  it("decodes percent-encoded Markdown links, accepts unquoted spaced Markdown file links, and preserves file:// and backticks", () => {
     const text = [
-      "Read [guide](docs/User%20Guide.md#L3) and [pct](docs/100%25.md).",
+      "Read [guide](docs/User%20Guide.md#L3), [bare-space](docs/User Guide.md#L2), [pct](docs/100%25.md).",
+      'Also [bare-titled](docs/Team Guide.md#L4 "Team Guide") and ignore prose [note](see above for details).',
       "Keep URI untouched: [uri](file:///C:/Work/User%20Guide.md#L2).",
       "Spaced backticks: `docs/Release Notes.md` and `docs/Install Guide.md#L4-L6` and literal `docs/100%25.md`.",
     ].join("\n");
@@ -83,7 +86,9 @@ describe("link-parser (live OMP reply file/URL link extraction)", () => {
     const links = parseReplyLinks(text, "msg-4");
     expect(links.map((l) => ({ label: l.label, rawTarget: l.rawTarget, anchor: l.anchor }))).toEqual([
       { label: "guide", rawTarget: "docs/User Guide.md", anchor: { startLine: 3 } },
+      { label: "bare-space", rawTarget: "docs/User Guide.md", anchor: { startLine: 2 } },
       { label: "pct", rawTarget: "docs/100%.md", anchor: undefined },
+      { label: "bare-titled", rawTarget: "docs/Team Guide.md", anchor: { startLine: 4 } },
       { label: "uri", rawTarget: "file:///C:/Work/User%20Guide.md", anchor: { startLine: 2 } },
       { label: "docs/Release Notes.md", rawTarget: "docs/Release Notes.md", anchor: undefined },
       {
@@ -92,6 +97,20 @@ describe("link-parser (live OMP reply file/URL link extraction)", () => {
         anchor: { startLine: 4, endLine: 6 },
       },
       { label: "docs/100%25.md", rawTarget: "docs/100%25.md", anchor: undefined },
+    ]);
+  });
+
+  it("filters out shell commands in backticks while preserving valid filenames with ampersands and leading hyphens", () => {
+    const text = [
+      "Run `cat README.md`, `git diff src/app.ts`, `node scripts/build.mjs`, or `./run.sh README.md`.",
+      "Do keep single-token files `docs/R&D.md`, `-notes.md`, and spaced `docs/R&D Notes.md#L2`.",
+    ].join("\n");
+
+    const links = parseReplyLinks(text, "msg-5");
+    expect(links.map((l) => ({ label: l.label, rawTarget: l.rawTarget, anchor: l.anchor }))).toEqual([
+      { label: "docs/R&D.md", rawTarget: "docs/R&D.md", anchor: undefined },
+      { label: "-notes.md", rawTarget: "-notes.md", anchor: undefined },
+      { label: "docs/R&D Notes.md#L2", rawTarget: "docs/R&D Notes.md", anchor: { startLine: 2 } },
     ]);
   });
 });
