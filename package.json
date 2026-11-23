@@ -1,0 +1,25 @@
+{
+  "name": "omp-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Windows-first desktop workspace around the installed OMP runtime with side-by-side file previews and isolated browser tabs.",
+  "main": "dist/main/main.cjs",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "start": "npm run build && electron .",
+    "test": "vitest run",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "pdfjs-dist": "6.5.438"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.65.1",
+    "@types/node": "^22.15.0",
+    "electron": "45.4.1",
+    "esbuild": "0.28.2",
+    "typescript": "5.9.3",
+    "vitest": "5.1.1"
+  }
+}

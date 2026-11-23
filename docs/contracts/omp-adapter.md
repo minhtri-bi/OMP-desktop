@@ -1,6 +1,6 @@
 # Contract: OMP Runtime Adapter (`omp-adapter`)
 
-- **Status**: Draft v0.1 (ready for integrator review; freeze before splitting runtime and UI implementation)
+- **Status**: Accepted v1.0 (frozen for Slice 4 implementation)
 - **Decision basis**: [`docs/decisions/omp-runtime.md`](../decisions/omp-runtime.md)
 - **Target OMP version**: `v19.1.1` (`--mode rpc-ui`, Protocol v2)
 

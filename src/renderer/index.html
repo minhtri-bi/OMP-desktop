@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; worker-src 'self' blob:; connect-src 'self';"
+    />
+    <title>OMP Desktop</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar" role="banner">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">OMP</span>
+          <h1 class="brand-title">OMP Desktop</h1>
+        </div>
+        <div class="topbar-meta">
+          <span id="runtime-badge" class="status-pill" data-testid="runtime-badge">
+            OMP RPC v2 · always-ask
+          </span>
+          <button id="open-folder-btn" class="btn btn-subtle" type="button" data-testid="open-folder-btn">
+            Open Folder
+          </button>
+          <button id="new-browser-tab-btn" class="btn btn-subtle" type="button" data-testid="new-browser-tab-btn">
+            + Browser Tab
+          </button>
+        </div>
+      </header>
+
+      <div class="workspace-grid">
+        <!-- Left Sidebar: Projects, File Explorer, and Chats -->
+        <aside class="sidebar" aria-label="Workspaces and chats">
+          <section class="sidebar-section">
+            <div class="section-header">
+              <h2>Projects</h2>
+            </div>
+            <div id="workspace-list" class="item-list" data-testid="workspace-list"></div>
+          </section>
+
+          <section class="sidebar-section">
+            <div class="section-header">
+              <h2>Chats</h2>
+            </div>
+            <div id="chat-list" class="item-list" data-testid="chat-list"></div>
+          </section>
+
+          <section class="sidebar-section sidebar-section-grow">
+            <div class="section-header">
+              <h2 id="explorer-heading" data-testid="explorer-heading">Explorer</h2>
+            </div>
+            <div id="file-tree" class="file-tree" data-testid="file-tree"></div>
+          </section>
+        </aside>
+
+        <!-- Center Pane: Chat Transcript & Persistent Composer -->
+        <main class="chat-pane" aria-label="Chat workspace">
+          <div class="chat-header">
+            <div class="chat-header-title-group">
+              <h2 id="active-chat-title" data-testid="active-chat-title">Chat</h2>
+              <span id="active-chat-scope" class="scope-badge" data-testid="active-chat-scope"></span>
+            </div>
+            <button
+              id="attach-standalone-btn"
+              class="btn btn-subtle hidden"
+              type="button"
+              data-testid="attach-standalone-btn"
+            >
+              Attach File
+            </button>
+          </div>
+
+          <div id="link-error-banner" class="error-banner hidden" role="alert" data-testid="link-error-banner">
+            <div class="error-banner-body">
+              <strong id="link-error-code" data-testid="link-error-code"></strong>
+              <span id="link-error-message" data-testid="link-error-message"></span>
+            </div>
+            <button id="dismiss-error-btn" class="icon-btn" type="button" aria-label="Dismiss error">
+              &times;
+            </button>
+          </div>
+
+          <div id="chat-transcript" class="chat-transcript" data-testid="chat-transcript"></div>
+
+          <form id="composer-form" class="composer" data-testid="composer-form">
+            <div id="standalone-attachments" class="attachment-strip hidden" data-testid="standalone-attachments"></div>
+            <div class="composer-row">
+              <textarea
+                id="composer-input"
+                class="composer-input"
+                rows="2"
+                placeholder="Message OMP (runtime approval mode: always-ask)..."
+                data-testid="composer-input"
+              ></textarea>
+              <button id="composer-send-btn" class="btn btn-primary" type="submit" data-testid="composer-send-btn">
+                Send
+              </button>
+            </div>
+          </form>
+        </main>
+
+        <!-- Right Pane: Shared File Preview & Isolated Browser Tabs -->
+        <section class="preview-pane" aria-label="Preview and browser tabs" data-testid="preview-pane">
+          <div id="tab-strip" class="tab-strip" role="tablist" data-testid="tab-strip"></div>
+
+          <div id="breadcrumbs-bar" class="breadcrumbs-bar hidden" data-testid="breadcrumbs-bar">
+            <nav id="breadcrumbs-nav" class="breadcrumbs-nav" aria-label="File path breadcrumbs"></nav>
+            <div id="breadcrumb-siblings" class="sibling-popover hidden" data-testid="breadcrumb-siblings"></div>
+          </div>
+
+          <div id="preview-toolbar" class="preview-toolbar hidden" data-testid="preview-toolbar"></div>
+
+          <div class="preview-stage" id="preview-stage">
+            <div id="preview-empty" class="preview-empty" data-testid="preview-empty">
+              <p class="preview-empty-title">Click any file chip or link in chat</p>
+              <p class="preview-empty-sub">
+                PDFs, source files, interactive HTML pages, and isolated browser tabs open side-by-side here while chat stays visible.
+              </p>
+            </div>
+
+            <div id="source-viewer" class="source-viewer hidden" data-testid="source-viewer"></div>
+
+            <div id="pdf-viewer" class="pdf-viewer hidden" data-testid="pdf-viewer">
+              <div class="pdf-canvas-wrap">
+                <canvas id="pdf-canvas" data-testid="pdf-canvas"></canvas>
+              </div>
+            </div>
+
+            <div id="isolated-view-host" class="isolated-view-host hidden" data-testid="isolated-view-host"></div>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

@@ -1,6 +1,6 @@
 # Decision: Windows Desktop & Browser Host (`browser-host`)
 
-- **Status**: Proposed (recommendation ready; **no app framework or dependencies selected yet** — awaiting owner sign-off)
+- **Status**: Accepted (**Option A — Electron + `WebContentsView`**, default-blocked external network on local HTML previews with per-tab opt-in toggle)
 - **Contract companion**: [`docs/contracts/file-reference-and-preview.md`](../contracts/file-reference-and-preview.md)
 
 ## Problem statement
@@ -75,7 +75,7 @@ Whichever host the owner approves, every preview and browser view MUST enforce a
 ### 5. Native Windows process supervision
 - Regardless of Electron vs Tauri vs WinUI 3, the trusted backend MUST manage `omp.exe` children under a Win32 Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) so abnormal app termination cannot leak live OMP or shell processes.
 
-## Open decision for project owner
+## Accepted decision
 
-- [ ] Approve **Option A (Electron + `WebContentsView`)**, **Option B (Tauri v2 + WebView2)**, or **Option C (WinUI 3 + WebView2)**.
-- [ ] Confirm default outbound network policy for **local interactive HTML previews** (recommended: block external network by default with a per-tab opt-in toggle; localhost previews and visible browser tabs allow normal HTTP/HTTPS).
+- [x] Approved **Option A (Electron + `WebContentsView`)** (owner decision).
+- [x] Confirmed default outbound network policy for **local interactive HTML previews**: block external network by default with a per-tab opt-in toggle; localhost previews and visible browser tabs allow normal HTTP/HTTPS.

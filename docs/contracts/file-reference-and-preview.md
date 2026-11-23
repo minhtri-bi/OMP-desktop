@@ -1,6 +1,6 @@
 # Contract: File Reference Resolution & Right-Hand Preview (`file-reference-and-preview`)
 
-- **Status**: Draft v0.1 (ready for integrator review; freeze before splitting implementation)
+- **Status**: Accepted v1.0 (frozen for Slice 4 implementation)
 - **Decision basis**: [`docs/decisions/workspace-ux.md`](../decisions/workspace-ux.md) and [`docs/decisions/browser-host.md`](../decisions/browser-host.md)
 - **Acceptance fixtures**: [`tests/fixtures/README.md`](../../tests/fixtures/README.md)
 
