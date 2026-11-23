@@ -122,6 +122,14 @@ test("ACC-01..ACC-08: real click-to-preview journey, project switching, standalo
     .evaluate((el) => (el as HTMLCanvasElement).width);
   expect(zoomedCanvasWidth).toBeGreaterThan(initialCanvasWidth);
 
+  // Regression: opening and closing breadcrumb popover on a PDF tab keeps current page and zoom
+  await page.getByTestId("breadcrumb-browsable-0").click();
+  await expect(page.getByTestId("breadcrumb-siblings")).toBeVisible();
+  await page.getByTestId("breadcrumb-browsable-0").click();
+  await expect(page.getByTestId("breadcrumb-siblings")).toBeHidden();
+  await expect(page.getByTestId("pdf-page-indicator")).toHaveText("Page 2 / 2");
+  await expect(page.getByTestId("pdf-zoom-indicator")).toHaveText("125%");
+
   // ACC-02: Click source link with line range + case-insensitive second click focuses same tab without duplicate
   await page.getByTestId("chat-link-link-source").click();
   await expect(page.getByTestId("source-viewer")).toBeVisible();
@@ -308,4 +316,89 @@ test("ACC-01..ACC-08: real click-to-preview journey, project switching, standalo
   const diagnostics = await page.evaluate(() => window.ompDesktop.getDiagnostics());
   expect(diagnostics.promptRequestCount).toBe(0);
   expect(diagnostics.attachmentUploadCount).toBe(0);
+});
+
+test("Open Folder creates a bound project chat and displays OMP replies via onOmpEvent", async () => {
+  const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-desktop-e2e-omp-"));
+  const openedFolder = path.join(stubDir, "opened-project");
+  const stubUserData = path.join(stubDir, "user-data");
+  fs.mkdirSync(openedFolder, { recursive: true });
+  fs.mkdirSync(stubUserData, { recursive: true });
+  fs.writeFileSync(path.join(openedFolder, "README.md"), "# Opened Project\n", "utf8");
+
+  const mockOmpScript = path.join(stubDir, "mock-omp.cjs");
+  fs.writeFileSync(
+    mockOmpScript,
+    `
+const readline = require("node:readline");
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+send({
+  type: "ready",
+  protocolVersion: 1,
+  supportedProtocolVersions: [1, 2],
+  maxFrameBytes: 1048576,
+  maxReassembledFrameBytes: 67108864,
+  supportsBashExcludeFromContext: true,
+});
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.type === "negotiate_protocol") {
+    send({ id: msg.id, type: "response", command: "negotiate_protocol", success: true, data: { protocolVersion: 2 } });
+  } else if (msg.type === "prompt") {
+    send({ id: msg.id, type: "response", command: "prompt", success: true, data: { agentInvoked: true } });
+    send({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "Reply from OMP in " + process.cwd() + ": " + msg.message }],
+      },
+    });
+    send({ type: "prompt_result", id: msg.id, agentInvoked: true, status: "completed", sessionSettled: true });
+  }
+});
+rl.on("close", () => process.exit(0));
+`,
+    "utf8",
+  );
+
+  const launchArgs = [path.resolve(process.cwd())];
+  if (process.platform === "linux") {
+    launchArgs.push("--no-sandbox", "--disable-gpu-sandbox");
+  }
+
+  const app2 = await electron.launch({
+    args: launchArgs,
+    env: {
+      ...process.env,
+      OMP_DESKTOP_FIXTURE_ROOT: fixtureCopyRoot,
+      OMP_DESKTOP_USER_DATA: stubUserData,
+      OMP_DESKTOP_OMP_PATH: process.execPath,
+      OMP_DESKTOP_OMP_ARGS_PREFIX: JSON.stringify([mockOmpScript]),
+    },
+  });
+
+  try {
+    const win2 = await app2.firstWindow();
+    await win2.waitForLoadState("domcontentloaded");
+
+    // Stub Electron's native openDirectory dialog to return openedFolder deterministically
+    await app2.evaluate(({ dialog }, targetDir) => {
+      dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [targetDir] });
+    }, openedFolder);
+
+    await win2.getByTestId("open-folder-btn").click();
+    await expect(win2.getByTestId("active-chat-scope")).toHaveText("Workspace: opened-project");
+    await expect(win2.getByTestId("explorer-heading")).toHaveText("Explorer · opened-project");
+
+    await win2.getByTestId("composer-input").fill("ping-new-folder");
+    await win2.getByTestId("composer-send-btn").click();
+
+    await expect(win2.getByTestId("chat-transcript")).toContainText("Reply from OMP in");
+    await expect(win2.getByTestId("chat-transcript")).toContainText("opened-project");
+    await expect(win2.getByTestId("chat-transcript")).toContainText("ping-new-folder");
+  } finally {
+    await app2.close();
+    fs.rmSync(stubDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 150 });
+  }
 });

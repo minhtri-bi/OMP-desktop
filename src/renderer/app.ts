@@ -516,7 +516,10 @@ async function toggleBreadcrumbSiblings(
 ): Promise<void> {
   if (!breadcrumbSiblingsEl.classList.contains("hidden")) {
     hideSiblingPopover();
-    await activateTab(activeTabKey);
+    const active = getActiveTab();
+    if (active && (active.kind === "html-isolated-browser" || active.kind === "browser")) {
+      await activateTab(activeTabKey);
+    }
     return;
   }
 
@@ -928,7 +931,89 @@ window.addEventListener("resize", () => {
   void syncActiveIsolatedViewBounds();
 });
 
+function extractAssistantText(rawMessage: unknown): { role: "assistant" | "system"; text: string } | null {
+  if (!rawMessage || typeof rawMessage !== "object") {
+    return null;
+  }
+  const msg = rawMessage as Record<string, unknown>;
+  const role = msg.role;
+  if (role === "user") {
+    return null;
+  }
+  const normalizedRole: "assistant" | "system" = role === "system" ? "system" : "assistant";
+
+  if (typeof msg.text === "string" && msg.text.trim().length > 0) {
+    return { role: normalizedRole, text: msg.text };
+  }
+  if (typeof msg.content === "string" && msg.content.trim().length > 0) {
+    return { role: normalizedRole, text: msg.content };
+  }
+  if (Array.isArray(msg.content)) {
+    const parts: string[] = [];
+    for (const block of msg.content) {
+      if (block && typeof block === "object") {
+        const record = block as Record<string, unknown>;
+        if (record.type === "text" && typeof record.text === "string") {
+          parts.push(record.text);
+        }
+      }
+    }
+    const joined = parts.join("\n").trim();
+    if (joined.length > 0) {
+      return { role: normalizedRole, text: joined };
+    }
+  }
+  return null;
+}
+
+const runtimeBadgeEl = document.getElementById("runtime-badge");
+
+function handleIncomingOmpEvent(payload: { chatId: string; event: import("../shared/contracts").OmpAdapterEvent }): void {
+  const { chatId, event } = payload;
+  const targetChat = chats.find((c) => c.chatId === chatId);
+
+  if (event.type === "ready") {
+    if (runtimeBadgeEl) {
+      runtimeBadgeEl.textContent = `OMP v${event.metadata.ompVersion} · RPC v2 · always-ask`;
+    }
+    return;
+  }
+
+  if (event.type === "message_end" && targetChat) {
+    const extracted = extractAssistantText(event.message);
+    if (extracted) {
+      targetChat.messages.push({
+        messageId: `omp-${Date.now()}-${targetChat.messages.length}`,
+        role: extracted.role,
+        text: extracted.text,
+        isRestoredMessage: false,
+      });
+      if (chatId === activeChatId) {
+        renderActiveChat();
+      }
+    }
+    return;
+  }
+
+  if (event.type === "prompt_result" && event.status === "error" && event.error) {
+    if (chatId === activeChatId) {
+      showError("OMP_PROMPT_ERROR", event.error);
+    }
+    return;
+  }
+
+  if (event.type === "transport_error") {
+    if (chatId === activeChatId) {
+      showError(event.code, event.message);
+    }
+  }
+}
+
 async function boot(): Promise<void> {
+  api.onOmpEvent((payload) => {
+    handleIncomingOmpEvent(payload);
+  });
+
   const bootstrap = await api.getBootstrap();
   workspaces = bootstrap.workspaces;
   activeWorkspaceId = bootstrap.activeWorkspaceId;

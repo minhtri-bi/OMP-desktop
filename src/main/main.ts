@@ -16,6 +16,7 @@ import type {
 } from "../shared/contracts";
 import { OmpRuntimeAdapter } from "./omp-adapter";
 import {
+  authorizeCanonicalReadPath,
   canonicalizeExistingPath,
   normalizeForComparison,
   resolveMessageFileLink,
@@ -215,19 +216,7 @@ function initializeFixtureOrDefaultState(): void {
 }
 
 function authorizeFileAccess(canonicalPath: string, owningBinding: ChatWorkspaceBinding): string {
-  const resolved = resolveMessageFileLink({
-    chatId: owningBinding.kind === "standalone" ? owningBinding.chatId : owningBinding.workspaceId,
-    messageId: "authorize-read",
-    isRestoredMessage: false,
-    owningBinding,
-    rawTarget: canonicalPath,
-  });
-  if (!resolved.ok || resolved.descriptor.viewerKind === "folder-explorer") {
-    throw new Error(
-      resolved.ok ? "Access denied: target is a directory." : `Access denied (${resolved.code}): ${resolved.message}`,
-    );
-  }
-  return resolved.descriptor.canonicalPath;
+  return authorizeCanonicalReadPath(canonicalPath, owningBinding);
 }
 
 function getOrCreateProjectChat(ws: WorkspaceDescriptor, forceNew = false): ChatThread {
@@ -506,6 +495,17 @@ function registerIpcHandlers(): void {
       return { ok: false, error: "Unknown chat thread." };
     }
     const ompBin = process.env.OMP_DESKTOP_OMP_PATH || "omp";
+    let ompArgsPrefix: string[] | undefined;
+    if (process.env.OMP_DESKTOP_OMP_ARGS_PREFIX) {
+      try {
+        const parsed = JSON.parse(process.env.OMP_DESKTOP_OMP_ARGS_PREFIX) as unknown;
+        if (Array.isArray(parsed) && parsed.every((item) => typeof item === "string")) {
+          ompArgsPrefix = parsed;
+        }
+      } catch {
+        // ignore malformed optional test override
+      }
+    }
     let adapter = adaptersByChatId.get(chatId);
     if (!adapter) {
       adapter = new OmpRuntimeAdapter();
@@ -523,6 +523,7 @@ function registerIpcHandlers(): void {
       try {
         await adapter.start({
           ompExecutablePath: ompBin,
+          ompArgsPrefix,
           scope:
             chat.owningBinding.kind === "project"
               ? {

@@ -25,9 +25,16 @@ export function stripWin32ExtendedPrefix(input: string): string {
   return input;
 }
 
+function isWindowsStylePath(input: string): boolean {
+  return process.platform === "win32" || /^[a-zA-Z]:[\\/]/.test(input) || /^[a-zA-Z]:$/.test(input);
+}
+
 export function normalizePathSlashes(input: string): string {
-  const cleaned = stripWin32ExtendedPrefix(input).replace(/\\/g, "/");
-  const trimmed = cleaned.replace(/\/+$/, "");
+  const cleaned = stripWin32ExtendedPrefix(input);
+  // Security: on POSIX, backslash is a legal filename character, NOT a path separator.
+  // Only convert backslashes on Windows or explicit Windows drive paths.
+  const normalizedSep = isWindowsStylePath(cleaned) ? cleaned.replace(/\\/g, "/") : cleaned;
+  const trimmed = normalizedSep.replace(/\/+$/, "");
   if (trimmed === "") {
     return "/";
   }
@@ -167,6 +174,42 @@ type SafeWalkResult =
   | { ok: false; code: "UNSAFE_PATH_SYNTAX" | "OUT_OF_WORKSPACE" | "MISSING"; reason: string };
 
 /**
+ * Verifies that a differently-cased Windows prefix actually identifies the exact same
+ * directory as `canonicalRoot` (preventing case-sensitive NTFS sibling rebasing).
+ */
+function verifyWindowsPrefixMatchesRoot(candidatePrefix: string, canonicalRoot: string): boolean {
+  const normRoot = normalizePathSlashes(canonicalRoot);
+  const normPrefix = normalizePathSlashes(candidatePrefix);
+  if (normPrefix === normRoot) {
+    return true;
+  }
+  if (process.platform !== "win32") {
+    return false;
+  }
+  // Walk each segment of candidatePrefix from the drive root using lstatSync so we
+  // never follow an unverified symlink/junction anywhere along a differently-cased prefix.
+  try {
+    const driveMatch = /^([a-zA-Z]:)\/(.*)$/.exec(normPrefix);
+    if (!driveMatch) {
+      return false;
+    }
+    let cur = `${driveMatch[1]}\\`;
+    const parts = driveMatch[2] ? driveMatch[2].split("/").filter(Boolean) : [];
+    for (const part of parts) {
+      cur = path.join(cur, part);
+      const ls = fs.lstatSync(cur);
+      if (ls.isSymbolicLink()) {
+        return false;
+      }
+    }
+    const realPrefix = canonicalizeExistingPath(candidatePrefix);
+    return normalizePathSlashes(realPrefix) === normRoot;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Walks path segments starting from `canonicalRoot` using `lstatSync` and `readlinkSync`
  * before ever calling `realpathSync` or `statSync`. This guarantees symlinks/junctions
  * pointing to UNC shares (`\\server\share`) or outside directories are rejected locally
@@ -181,7 +224,30 @@ function safeWalkWithinCanonicalRoot(
     return { ok: false, code: "OUT_OF_WORKSPACE", reason: "Exceeded maximum symlink depth." };
   }
 
-  // Pre-check candidate containment (allow case-insensitive only on Windows for uncanonicalized input)
+  // Re-verify that the registered root itself has not been replaced with a symlink to another directory
+  let currentRootCanonical: string;
+  try {
+    const rootLstat = fs.lstatSync(canonicalRoot);
+    if (rootLstat.isSymbolicLink()) {
+      return {
+        ok: false,
+        code: "OUT_OF_WORKSPACE",
+        reason: "Owning workspace root was replaced with a symlink.",
+      };
+    }
+    currentRootCanonical = canonicalizeExistingPath(canonicalRoot);
+  } catch {
+    return { ok: false, code: "OUT_OF_WORKSPACE", reason: "Owning workspace root is unavailable." };
+  }
+  if (normalizePathSlashes(currentRootCanonical) !== normalizePathSlashes(canonicalRoot)) {
+    return {
+      ok: false,
+      code: "OUT_OF_WORKSPACE",
+      reason: "Owning workspace root changed on disk (possible symlink swap).",
+    };
+  }
+
+  // Pre-check candidate containment (allow case-insensitive prefix only on Windows after verifying identity)
   if (!isPathWithinRoot(candidatePath, canonicalRoot, process.platform === "win32")) {
     return { ok: false, code: "OUT_OF_WORKSPACE", reason: "Path escapes owning workspace root." };
   }
@@ -191,17 +257,36 @@ function safeWalkWithinCanonicalRoot(
   const rootPrefix = normRoot.endsWith("/") ? normRoot : `${normRoot}/`;
 
   let relativePart = "";
-  if (
-    normalizeForComparison(normCandidate, process.platform === "win32") ===
-    normalizeForComparison(normRoot, process.platform === "win32")
-  ) {
+  if (normCandidate === normRoot) {
     relativePart = "";
-  } else if (
-    normalizeForComparison(normCandidate, process.platform === "win32").startsWith(
-      normalizeForComparison(rootPrefix, process.platform === "win32"),
-    )
-  ) {
+  } else if (normCandidate.startsWith(rootPrefix)) {
     relativePart = normCandidate.slice(rootPrefix.length);
+  } else if (process.platform === "win32") {
+    const lowerRoot = normRoot.toLowerCase();
+    const lowerCandidate = normCandidate.toLowerCase();
+    const lowerPrefix = rootPrefix.toLowerCase();
+    if (lowerCandidate === lowerRoot) {
+      if (!verifyWindowsPrefixMatchesRoot(normCandidate, canonicalRoot)) {
+        return {
+          ok: false,
+          code: "OUT_OF_WORKSPACE",
+          reason: "Case-differing Windows path identifies a different directory.",
+        };
+      }
+      relativePart = "";
+    } else if (lowerCandidate.startsWith(lowerPrefix)) {
+      const candidatePrefix = normCandidate.slice(0, normRoot.length);
+      if (!verifyWindowsPrefixMatchesRoot(candidatePrefix, canonicalRoot)) {
+        return {
+          ok: false,
+          code: "OUT_OF_WORKSPACE",
+          reason: "Case-differing Windows path identifies a different directory.",
+        };
+      }
+      relativePart = normCandidate.slice(rootPrefix.length);
+    } else {
+      return { ok: false, code: "OUT_OF_WORKSPACE", reason: "Path escapes owning workspace root." };
+    }
   } else {
     return { ok: false, code: "OUT_OF_WORKSPACE", reason: "Path escapes owning workspace root." };
   }
@@ -229,18 +314,29 @@ function safeWalkWithinCanonicalRoot(
       }
 
       const strippedLink = stripWin32ExtendedPrefix(rawLinkTarget);
-      const linkSyntax = validatePathSyntax(strippedLink);
-      if (!linkSyntax.ok) {
+      // Validate dangerous symlink targets (UNC, device, NUL); note POSIX absolute symlinks may live in colon dirs,
+      // so check UNC/device/control/ADS carefully without breaking legitimate POSIX workspace directories with colons.
+      if (/[\x00-\x1f]/.test(strippedLink) || strippedLink.startsWith("\\\\") || strippedLink.startsWith("//")) {
         return {
           ok: false,
           code: "UNSAFE_PATH_SYNTAX",
-          reason: `Blocked unsafe symlink target: ${linkSyntax.reason}`,
+          reason: "Blocked unsafe symlink target (UNC, extended, device, or control characters).",
         };
       }
+      if (process.platform === "win32") {
+        const linkSyntax = validatePathSyntax(strippedLink);
+        if (!linkSyntax.ok) {
+          return {
+            ok: false,
+            code: "UNSAFE_PATH_SYNTAX",
+            reason: `Blocked unsafe symlink target: ${linkSyntax.reason}`,
+          };
+        }
+      }
 
-      const resolvedLinkTarget = isAbsolutePathCrossPlatform(linkSyntax.cleanedTarget)
-        ? linkSyntax.cleanedTarget
-        : path.resolve(current, linkSyntax.cleanedTarget.replace(/\\/g, path.sep));
+      const resolvedLinkTarget = isAbsolutePathCrossPlatform(strippedLink)
+        ? strippedLink
+        : path.resolve(current, process.platform === "win32" ? strippedLink.replace(/\\/g, path.sep) : strippedLink);
 
       const remaining = segments.slice(i + 1);
       const combinedTarget =
@@ -337,7 +433,6 @@ export function buildPreviewTabKey(
   canonicalPath: string,
   preferSourceView?: boolean,
 ): string {
-  // Always fold tab keys case-insensitively on Windows; keep exact case on case-sensitive POSIX
   const normKey = normalizeForComparison(canonicalPath, true);
   const baseKey =
     owningBinding.kind === "project"
@@ -348,6 +443,65 @@ export function buildPreviewTabKey(
 
 export function isAbsolutePathCrossPlatform(p: string): boolean {
   return path.isAbsolute(p) || /^[a-zA-Z]:[\\/]/.test(p);
+}
+
+/**
+ * Authorizes an already-resolved filesystem path (e.g. from readSourceFile / readPdfBytes)
+ * without reparsing trusted root path segments (like POSIX folders containing colons) as raw link syntax.
+ */
+export function authorizeCanonicalReadPath(
+  candidatePath: string,
+  owningBinding: ChatWorkspaceBinding,
+): string {
+  if (!candidatePath || /[\x00-\x1f]/.test(candidatePath)) {
+    throw new Error("Access denied: invalid file path.");
+  }
+  if (candidatePath.startsWith("\\\\") || candidatePath.startsWith("//")) {
+    throw new Error("Access denied: UNC or device path is blocked.");
+  }
+
+  if (owningBinding.kind === "standalone") {
+    const allowlist = new Set(
+      owningBinding.attachedCanonicalPaths.map((p) =>
+        normalizeForComparison(p, process.platform === "win32"),
+      ),
+    );
+    const normalizedCandidate = normalizeForComparison(
+      path.resolve(candidatePath),
+      process.platform === "win32",
+    );
+    if (!allowlist.has(normalizedCandidate)) {
+      throw new Error("Access denied: file is outside standalone chat attachments.");
+    }
+    const ls = fs.lstatSync(candidatePath);
+    if (ls.isSymbolicLink()) {
+      const target = stripWin32ExtendedPrefix(fs.readlinkSync(candidatePath));
+      if (target.startsWith("\\\\") || target.startsWith("//")) {
+        throw new Error("Access denied: unsafe symlink target.");
+      }
+    }
+    const real = canonicalizeExistingPath(candidatePath);
+    const exactAllowlist = new Set(
+      owningBinding.attachedCanonicalPaths.map((p) => normalizePathSlashes(p)),
+    );
+    if (!exactAllowlist.has(normalizePathSlashes(real))) {
+      throw new Error("Access denied: attached file resolved outside allowlist.");
+    }
+    if (fs.statSync(real).isDirectory()) {
+      throw new Error("Access denied: target is a directory.");
+    }
+    return real;
+  }
+
+  const canonicalRoot = canonicalizeExistingPath(owningBinding.workspaceRoot);
+  const walked = safeWalkWithinCanonicalRoot(canonicalRoot, candidatePath);
+  if (!walked.ok) {
+    throw new Error(`Access denied (${walked.code}): ${walked.reason}`);
+  }
+  if (walked.stat.isDirectory()) {
+    throw new Error("Access denied: target is a directory.");
+  }
+  return walked.canonicalPath;
 }
 
 export function resolveMessageFileLink(request: MessageFileLinkRequest): PathResolutionResult {
@@ -406,9 +560,8 @@ export function resolveMessageFileLink(request: MessageFileLinkRequest): PathRes
       } catch {
         return fail("UNATTACHED_STANDALONE_PATH", "Attached symlink could not be read.", displayTarget);
       }
-      const linkSyntax = validatePathSyntax(linkTarget);
-      if (!linkSyntax.ok) {
-        return fail("UNSAFE_PATH_SYNTAX", linkSyntax.reason, displayTarget);
+      if (linkTarget.startsWith("\\\\") || linkTarget.startsWith("//") || /[\x00-\x1f]/.test(linkTarget)) {
+        return fail("UNSAFE_PATH_SYNTAX", "Blocked unsafe symlink target.", displayTarget);
       }
     }
 
@@ -557,9 +710,8 @@ export function resolvePreviewSubresource(
     if (lstat.isSymbolicLink()) {
       try {
         const target = stripWin32ExtendedPrefix(fs.readlinkSync(singleFileOnlyCanonicalPath));
-        const linkSyntax = validatePathSyntax(target);
-        if (!linkSyntax.ok) {
-          return { ok: false, statusCode: 403, reason: linkSyntax.reason };
+        if (target.startsWith("\\\\") || target.startsWith("//") || /[\x00-\x1f]/.test(target)) {
+          return { ok: false, statusCode: 403, reason: "Unsafe standalone symlink target." };
         }
       } catch {
         return { ok: false, statusCode: 403, reason: "Standalone preview symlink unreadable." };

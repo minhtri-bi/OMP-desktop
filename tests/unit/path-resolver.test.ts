@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
+  authorizeCanonicalReadPath,
   buildPreviewTabKey,
   canonicalizeExistingPath,
   isPathWithinRoot,
@@ -164,12 +165,11 @@ describe("path-resolver (Windows-first canonicalization & isolation)", () => {
   });
 
   it("produces identical case-insensitive tab keys across Windows path variants", () => {
-    const canonical = canonicalizeExistingPath(path.join(wsA, "src", "hello.ts"));
-    const keyLower = buildPreviewTabKey(bindingA, canonical);
-    const keyUpper = buildPreviewTabKey(bindingA, canonical.toUpperCase());
-    const keyBackslash = buildPreviewTabKey(bindingA, canonical.replace(/\//g, "\\"));
-    expect(keyLower).toBe(keyUpper);
-    expect(keyLower).toBe(keyBackslash);
+    const winForward = buildPreviewTabKey(bindingA, "C:/Work/workspace-a/src/hello.ts");
+    const winBackslash = buildPreviewTabKey(bindingA, "c:\\work\\WORKSPACE-A\\SRC\\HELLO.TS");
+    const winExtended = buildPreviewTabKey(bindingA, "\\\\?\\C:\\Work\\workspace-a\\src\\hello.ts");
+    expect(winForward).toBe(winBackslash);
+    expect(winForward).toBe(winExtended);
   });
 
   it("distinguishes STALE_LINK (restored) from MISSING_FILE (live)", () => {
@@ -330,5 +330,63 @@ describe("path-resolver (Windows-first canonicalization & isolation)", () => {
       expect(subRes.ok).toBe(false);
       if (!subRes.ok) expect(subRes.statusCode).toBe(403);
     }
+  });
+
+  it("allows reading files inside POSIX folders whose names contain colons without reparsing root as Windows link syntax", () => {
+    if (process.platform === "win32") return;
+    const colonDir = path.join(tempDir, "release:2026");
+    fs.mkdirSync(colonDir, { recursive: true });
+    const readmePath = path.join(colonDir, "README.md");
+    fs.writeFileSync(readmePath, "# Release 2026\n", "utf8");
+
+    const colonBinding: Extract<ChatWorkspaceBinding, { kind: "project" }> = {
+      kind: "project",
+      workspaceId: "ws-colon",
+      workspaceRoot: canonicalizeExistingPath(colonDir),
+      workspaceDisplayName: "release:2026",
+    };
+
+    const resolved = resolveMessageFileLink({
+      chatId: "chat-colon",
+      messageId: "m1",
+      isRestoredMessage: false,
+      owningBinding: colonBinding,
+      rawTarget: "README.md",
+    });
+    expect(resolved.ok).toBe(true);
+    if (resolved.ok) {
+      const authorized = authorizeCanonicalReadPath(resolved.descriptor.canonicalPath, colonBinding);
+      expect(authorized).toBe(canonicalizeExistingPath(readmePath));
+    }
+  });
+
+  it("does not treat literal backslashes on POSIX as path separators and rejects root symlink swaps", () => {
+    if (process.platform === "win32") return;
+    expect(isPathWithinRoot("/tmp/workspace-a\\evil/secret.txt", "/tmp/workspace-a")).toBe(false);
+
+    const backslashSibling = path.join(tempDir, "workspace-a\\evil");
+    fs.mkdirSync(backslashSibling, { recursive: true });
+    const siblingSecret = path.join(backslashSibling, "secret.txt");
+    fs.writeFileSync(siblingSecret, "BACKSLASH_SIBLING_SECRET", "utf8");
+
+    const symName = "backslash-escape.txt";
+    fs.symlinkSync(siblingSecret, path.join(wsA, symName), "file");
+
+    const subRes = resolvePreviewSubresource(canonicalizeExistingPath(wsA), `/${symName}`);
+    expect(subRes.ok).toBe(false);
+    if (!subRes.ok) expect(subRes.statusCode).toBe(403);
+
+    // Swap a workspace root itself to a symlink pointing outside and confirm preview subresource rejects it
+    const swappable = path.join(tempDir, "ws-swappable");
+    fs.mkdirSync(swappable, { recursive: true });
+    fs.writeFileSync(path.join(swappable, "index.html"), "<h1>ok</h1>", "utf8");
+    const registeredRoot = canonicalizeExistingPath(swappable);
+
+    fs.rmSync(swappable, { recursive: true, force: true });
+    fs.symlinkSync(outsideDir, swappable, "dir");
+
+    const afterSwap = resolvePreviewSubresource(registeredRoot, "/secret.txt");
+    expect(afterSwap.ok).toBe(false);
+    if (!afterSwap.ok) expect(afterSwap.statusCode).toBe(403);
   });
 });
