@@ -7,8 +7,9 @@ const HASH_LINE_ANCHOR_RE = /^(.*)#L(\d+)(?:-L?(\d+))?$/i;
 const COLON_LINE_ANCHOR_RE = /^(.*\.[a-zA-Z0-9_-]+):(\d+)(?:-(\d+))?$/;
 
 const SINGLE_TOKEN_SHELL_CHAIN_RE = /[\x00-\x1f;<>|]|&&|\|\|/;
-const MULTIWORD_SHELL_SYNTAX_RE = /[\x00-\x1f;<>|=$"']|&&|\|\|/;
-const MULTIWORD_CLI_FLAG_RE = /(?:^|\s)--?[a-zA-Z0-9]/;
+const SINGLE_TOKEN_OPTION_ASSIGN_RE = /^(?:--?[a-zA-Z0-9][a-zA-Z0-9._-]*|[A-Za-z_][A-Za-z0-9_]*)=/;
+const MULTIWORD_SHELL_SYNTAX_RE = /[\x00-\x1f;<>|=$"]|&&|\|\||(?:^|\s)'/;
+const MULTIWORD_CLI_FLAG_RE = /(?:^--[a-zA-Z0-9]|\s--?[a-zA-Z0-9])/;
 const EXPLICIT_PATH_PREFIX_RE = /^(?:\.\.?[\\/]|\/|~\/|file:\/\/|[a-zA-Z]:[\\/])/i;
 const EXECUTABLE_OR_FILE_ARG_EXT_RE =
   /\.(?:exe|cmd|bat|ps1|sh|bash|zsh|ts|tsx|js|jsx|mjs|cjs|py|rs|go|java|json|yml|yaml|toml|md|txt|html|htm|css|pdf|sql|xml|csv)$/i;
@@ -390,8 +391,14 @@ function scanMarkdownLinks(text: string): ScannedMarkdownLink[] {
           pos += 1;
           continue;
         }
-        if (ch === "[" && seenWhitespace && parenDepth === 0) {
-          // Do not swallow a subsequent Markdown link on the same line inside prose
+        if (
+          ch === "[" &&
+          seenWhitespace &&
+          parenDepth === 0 &&
+          startsMarkdownLinkAt(text, pos, lineEndIdx)
+        ) {
+          // Do not swallow a subsequent Markdown link on the same line inside prose,
+          // while still allowing literal brackets in spaced filenames (e.g. `docs/Release [Draft].md`).
           break;
         }
         pos += 1;
@@ -413,6 +420,32 @@ function scanMarkdownLinks(text: string): ScannedMarkdownLink[] {
   }
 
   return results;
+}
+
+/**
+ * Returns true if `text[start]` ('[') opens a valid `[label](` Markdown link on the same line.
+ */
+function startsMarkdownLinkAt(text: string, start: number, lineEndIdx: number): boolean {
+  if (start >= lineEndIdx || text[start] !== "[") {
+    return false;
+  }
+  let depth = 1;
+  for (let j = start + 1; j < lineEndIdx; j += 1) {
+    const ch = text[j]!;
+    if (ch === "\\" && j + 1 < lineEndIdx) {
+      j += 1;
+      continue;
+    }
+    if (ch === "[") {
+      depth += 1;
+    } else if (ch === "]") {
+      depth -= 1;
+      if (depth === 0) {
+        return j > start + 1 && j + 1 < lineEndIdx && text[j + 1] === "(";
+      }
+    }
+  }
+  return false;
 }
 
 /**
@@ -515,7 +548,7 @@ export function parseReplyLinks(text: string, messageId: string): ChatLinkItem[]
   const withoutMarkdownLinks = chunks.join("");
 
   // 2. Single-line inline code file references (supporting spaced paths & legal punctuation,
-  //    while filtering out multi-word shell commands like `cat README.md`)
+  //    while filtering out multi-word shell commands and single-token CLI options/assignments)
   const inlineCodeRe = /`([^`\r\n]+)`/g;
   for (const match of withoutMarkdownLinks.matchAll(inlineCodeRe)) {
     const token = match[1]?.trim();
@@ -527,7 +560,10 @@ export function parseReplyLinks(text: string, messageId: string): ChatLinkItem[]
       if (looksLikeCommandSpan(token)) {
         continue;
       }
-    } else if (SINGLE_TOKEN_SHELL_CHAIN_RE.test(token)) {
+    } else if (
+      SINGLE_TOKEN_SHELL_CHAIN_RE.test(token) ||
+      SINGLE_TOKEN_OPTION_ASSIGN_RE.test(token)
+    ) {
       continue;
     }
 

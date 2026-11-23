@@ -100,17 +100,33 @@ describe("link-parser (live OMP reply file/URL link extraction)", () => {
     ]);
   });
 
-  it("filters out shell commands in backticks while preserving valid filenames with ampersands and leading hyphens", () => {
+  it("filters out shell commands and option/assignment tokens while preserving valid filenames", () => {
     const text = [
-      "Run `cat README.md`, `git diff src/app.ts`, `node scripts/build.mjs`, or `./run.sh README.md`.",
-      "Do keep single-token files `docs/R&D.md`, `-notes.md`, and spaced `docs/R&D Notes.md#L2`.",
+      "Run `cat README.md`, `git diff src/app.ts`, `node scripts/build.mjs`, `./run.sh README.md`, `--config=app.json`, `-c=app.json`, or `CONFIG=app.json`.",
+      "Do keep `docs/R&D.md`, `-notes.md`, `-notes v2.md`, `docs/config=v2.json`, `docs/Bob's Notes.md`, and `docs/R&D Notes.md#L2`.",
     ].join("\n");
 
     const links = parseReplyLinks(text, "msg-5");
     expect(links.map((l) => ({ label: l.label, rawTarget: l.rawTarget, anchor: l.anchor }))).toEqual([
       { label: "docs/R&D.md", rawTarget: "docs/R&D.md", anchor: undefined },
       { label: "-notes.md", rawTarget: "-notes.md", anchor: undefined },
+      { label: "-notes v2.md", rawTarget: "-notes v2.md", anchor: undefined },
+      { label: "docs/config=v2.json", rawTarget: "docs/config=v2.json", anchor: undefined },
+      { label: "docs/Bob's Notes.md", rawTarget: "docs/Bob's Notes.md", anchor: undefined },
       { label: "docs/R&D Notes.md#L2", rawTarget: "docs/R&D Notes.md", anchor: { startLine: 2 } },
+    ]);
+  });
+
+  it("supports spaced filenames containing brackets while recovering from malformed destinations before a real link", () => {
+    const text = [
+      "Open [Release](docs/Release [Draft].md#L2-L4) for notes.",
+      "Malformed [broken](see [real](src/hello.ts#L5) on the same line.",
+    ].join("\n");
+
+    const links = parseReplyLinks(text, "msg-6");
+    expect(links.map((l) => ({ label: l.label, rawTarget: l.rawTarget, anchor: l.anchor }))).toEqual([
+      { label: "Release", rawTarget: "docs/Release [Draft].md", anchor: { startLine: 2, endLine: 4 } },
+      { label: "real", rawTarget: "src/hello.ts", anchor: { startLine: 5 } },
     ]);
   });
 });
