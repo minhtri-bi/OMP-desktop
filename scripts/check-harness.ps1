@@ -63,7 +63,7 @@ try {
     }
     $forbiddenTracked = @(
         $trackedFiles | Where-Object {
-            $_ -imatch '^\.omp/(status\.md|agent/|local/|roadmap/)' -or
+            $_ -imatch '^\.omp/(status\.md(?:$|/)|agent/|local/|roadmap/)' -or
             $_ -imatch '^\.worktrees/' -or
             $_ -imatch '^graphify-out/' -or
             (($_ -imatch '(^|/)\.env($|\.)') -and ($_ -inotmatch '(^|/)\.env\.example$'))
