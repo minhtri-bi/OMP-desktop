@@ -39,3 +39,4 @@ jobs:
           Remove-Item Env:OMP_PROFILE, Env:PI_PROFILE -ErrorAction SilentlyContinue
           $env:PI_CODING_AGENT_DIR = Join-Path $env:RUNNER_TEMP 'omp-harness-agent'
           ./scripts/check-harness.ps1 -OmpPath $ompPath
+          ./scripts/probe-omp-rpc.ps1 -OmpPath $ompPath

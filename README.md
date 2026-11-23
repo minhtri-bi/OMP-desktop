@@ -12,7 +12,7 @@ Match the Antigravity interaction: clicking a filename chip or file link in chat
 
 ## Start working
 
-- Read [project rules](.omp/AGENTS.md) and the primary checkout's existing local `.omp/STATUS.md`, if present. That ledger records ownership only, not feature progress; never commit or copy it.
+- Read [project rules](.omp/AGENTS.md) and the primary checkout's existing local `.omp/STATUS.md`, if present (see [`.omp/STATUS.md.example`](.omp/STATUS.md.example) for the ownership-only schema). That ledger records ownership only, not feature progress; never commit or copy it.
 - Assign one owner per task with this contract: `Goal | base SHA | branch and absolute worktree | literal write paths | read-only dependencies | primary skill | expected and preserved behavior | exact check`. Follow the [required skill routes](.omp/AGENTS.md#required-skill-routing). New paths need an updated claim before editing.
 - The integrator owns shared interfaces, root build files, and integration. Keep dependent tasks queued until their required contract lands on an agreed base.
 
@@ -52,29 +52,30 @@ Use the existing Graphify integration for static code impact, not for judging ta
 
 Keep private progress receipts and generated graphs local. The PR is the review record, not a mirror of the roadmap.
 
-## Suggested first assignments
+## Decision records and shared contracts
 
-These are independent proposals, not active claims. Each agent owns the evidence and a single written decision. Start implementation after the integration owner agrees on the shared contract.
+Proposed decisions and draft contracts are ready for integrator sign-off before framework selection and implementation:
 
-| Slice | Candidate write scope | Acceptance |
+| Slice | Decision record | Shared contract / artifacts |
 | --- | --- | --- |
-| OMP runtime | `docs/decisions/omp-runtime.md` | Probe installed OMP RPC without a paid prompt. Record the version, `--mode rpc` vs `--mode rpc-ui` approval/dialog surfaces, protocol v2 chunking, standalone CWD isolation, Windows child-process cleanup, unsupported operations, and reproducible evidence. |
-| Desktop and browser host | `docs/decisions/browser-host.md` | Compare Windows hosts for the shared preview pane. Explain how to render PDF and interactive local HTML with per-workspace/preview origin isolation, isolate browser profiles, block dangerous URI schemes, handle Windows child-webview airspace/overlays, and keep page content away from app IPC. |
-| Folder and chat workflow | `docs/decisions/workspace-ux.md` | Specify file chips, the side-by-side preview, breadcrumb navigation (including standalone chat's explicit-attachment boundary), case-insensitive tab deduplication/restore, standalone/project chats, and exact Windows path canonicalization (symlinks/junctions, UNC/device paths, prefix collisions, stale links). |
+| OMP runtime | [`docs/decisions/omp-runtime.md`](docs/decisions/omp-runtime.md) | [`docs/contracts/omp-adapter.md`](docs/contracts/omp-adapter.md), [`scripts/probe-omp-rpc.ps1`](scripts/probe-omp-rpc.ps1) |
+| Desktop and browser host | [`docs/decisions/browser-host.md`](docs/decisions/browser-host.md) | [`docs/contracts/file-reference-and-preview.md`](docs/contracts/file-reference-and-preview.md) |
+| Folder and chat workflow | [`docs/decisions/workspace-ux.md`](docs/decisions/workspace-ux.md) | [`docs/contracts/file-reference-and-preview.md`](docs/contracts/file-reference-and-preview.md), [`tests/fixtures/`](tests/fixtures/README.md) |
 
 The first integrated path must open a folder and display files from its chat in the right-hand pane. Switching to standalone chat must preserve each chat's own context. Both use the same OMP adapter. Verify this flow in the running Windows app before broadening the surface.
 
 ## Verification and delivery
 
-Run the same harness check as CI from PowerShell with `omp` and Git on `PATH`:
+Run the same harness and zero-cost RPC probe checks as CI from PowerShell with `omp` and Git on `PATH`:
 
 ```powershell
 .\scripts\check-harness.ps1
+.\scripts\probe-omp-rpc.ps1
 ```
 
-The [Verify workflow](.github/workflows/verify.yml) runs on Windows for PRs targeting `main` and pushes to `main`. It verifies the SHA-256 of the pinned OMP release, then checks the project and effective task/worktree settings (`task.isolation.apply`, `task.speculativeLaunch`, `worktree.clone`), `.gitignore` exclusion of local coordination/worktree/graph/env paths, and that none of those paths are tracked in Git. It does not start a worker, send a prompt, or build the app.
+The [Verify workflow](.github/workflows/verify.yml) runs on Windows for PRs targeting `main` and pushes to `main`. It verifies the SHA-256 of the pinned OMP release, checks the project and effective task/worktree settings (`task.isolation.apply`, `task.speculativeLaunch`, `worktree.clone`), checks `.gitignore` exclusion and tracked-file cleanliness for local coordination/worktree/graph/env paths, and runs the zero-cost OMP RPC protocol probe (`--mode rpc` and `--mode rpc-ui`). It does not start a worker, send a prompt, or build the app.
 
-For every feature, name the new behavior and the existing behavior that must remain intact. Add the smallest deterministic check that protects each affected path. The first runnable app change must wire its real Windows build and core journey tests into this workflow. At minimum, test a restored chat opening a real file beside the same chat, link resolution after switching projects, and rejection of a path outside its workspace. Use isolated fixtures and separately confirm native UI behavior in the running Windows app.
+For every feature, name the new behavior and the existing behavior that must remain intact. Add the smallest deterministic check that protects each affected path. The first runnable app change must wire its real Windows build and core journey tests into this workflow. At minimum, test a restored chat opening a real file beside the same chat, link resolution after switching projects, and rejection of a path outside its workspace. Use isolated fixtures in [`tests/fixtures/`](tests/fixtures/README.md) and separately confirm native UI behavior in the running Windows app.
 
 After the local check, commit owned changes with OMP's selective commit tool (or scoped `git add <owned-paths> && git commit` when local OMP extensions are unavailable). Push the task branch to the approved `origin`, then open or update one PR targeting `main` with the [review template](.github/pull_request_template.md). The project owner reviews and merges. If `origin/main` does not exist, ask the owner to authorize its initial seed; do not push the task branch first and accidentally set it as the default.
 

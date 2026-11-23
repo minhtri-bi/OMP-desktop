@@ -1,0 +1,17 @@
+# OMP Desktop Active Claims (Template)
+
+> Copy this structure into the ignored local `.omp/STATUS.md` in the **primary checkout** only.
+> Never commit or copy `.omp/STATUS.md` into a linked worktree.
+> Keep this ledger **ownership-only**; track milestones, progress, checks, and blockers in the coordinator's `project_roadmap` and in PRs.
+
+## Active claims
+
+| Owner | Goal | Base SHA | Branch & absolute worktree | Literal `Write` paths | Read-only `Shared` dependencies | Primary skill | Expected & preserved behavior | Exact check |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `<agent-or-user>` | `<one-line goal>` | `<40-char base SHA>` | `<branch>` — `<C:\path\to\repo\.worktrees\task>` | `<literal file/dir paths>` | `<read-only contracts/docs>` | `<skill-name>` | `Expected: <new>. Preserved: <unchanged>.` | `<exact verification command>` |
+
+## Rules reminder
+
+- Check all active claims case-insensitively before claiming a path on Windows.
+- Stop and request integrator resolution before editing any overlapping or shared path.
+- Remove a row once its PR is merged or the claim is released.
