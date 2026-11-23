@@ -2,6 +2,9 @@
 /.omp/STATUS.md
 /.omp/agent/
 /.omp/local/
+/.omp/roadmap/
+/.worktrees/
+/graphify-out/
 
 # Keep personal configuration and credentials out of Git
 .env
