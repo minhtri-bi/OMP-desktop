@@ -1,0 +1,68 @@
+{
+  "schemaVersion": 1,
+  "chatId": "chat-restored-workspace-a-001",
+  "owningBinding": {
+    "kind": "project",
+    "workspaceId": "ws-fixture-a",
+    "workspaceRelativeFixtureRoot": "tests/fixtures/workspace-a",
+    "workspaceDisplayName": "workspace-a"
+  },
+  "messages": [
+    {
+      "messageId": "msg-001",
+      "role": "assistant",
+      "isRestoredMessage": true,
+      "links": [
+        {
+          "id": "link-pdf",
+          "label": "sample.pdf",
+          "rawTarget": "docs/sample.pdf",
+          "expectedOutcome": "pdf"
+        },
+        {
+          "id": "link-source",
+          "label": "hello.ts",
+          "rawTarget": "src/hello.ts",
+          "anchor": { "startLine": 5, "endLine": 10 },
+          "expectedOutcome": "source"
+        },
+        {
+          "id": "link-source-case-variant",
+          "label": "HELLO.TS",
+          "rawTarget": "SRC\\HELLO.TS",
+          "expectedOutcome": "focus-existing-source-tab"
+        },
+        {
+          "id": "link-html",
+          "label": "preview.html",
+          "rawTarget": "web/preview.html",
+          "expectedOutcome": "html-isolated-browser"
+        },
+        {
+          "id": "link-stale",
+          "label": "deleted.pdf",
+          "rawTarget": "docs/deleted.pdf",
+          "expectedErrorCode": "STALE_LINK"
+        },
+        {
+          "id": "link-traversal",
+          "label": "secret.txt",
+          "rawTarget": "../outside-workspace/secret.txt",
+          "expectedErrorCode": "OUT_OF_WORKSPACE"
+        },
+        {
+          "id": "link-prefix-collision",
+          "label": "file.txt",
+          "rawTarget": "../workspace-a-sibling/file.txt",
+          "expectedErrorCode": "OUT_OF_WORKSPACE"
+        },
+        {
+          "id": "link-unc",
+          "label": "win.ini",
+          "rawTarget": "\\\\127.0.0.1\\c$\\Windows\\win.ini",
+          "expectedErrorCode": "UNSAFE_PATH_SYNTAX"
+        }
+      ]
+    }
+  ]
+}

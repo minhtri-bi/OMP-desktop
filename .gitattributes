@@ -4,3 +4,6 @@
 # Windows batch scripts require CRLF
 *.bat text eol=crlf
 *.cmd text eol=crlf
+
+# Preserve exact byte offsets for binary fixtures
+*.pdf binary
