@@ -1,6 +1,6 @@
 # Decision: Folder, Chat, and Click-to-Preview Workflow (`workspace-ux`)
 
-- **Status**: Proposed (awaiting integrator sign-off before splitting implementation)
+- **Status**: Accepted (frozen with `docs/contracts/file-reference-and-preview.md`)
 - **Contract companion**: [`docs/contracts/file-reference-and-preview.md`](../contracts/file-reference-and-preview.md)
 
 ## Core interaction summary
@@ -118,4 +118,4 @@ Detailed fixtures live in [`tests/fixtures/`](../../tests/fixtures/README.md) an
 ## Open items before implementation
 
 - [ ] Confirm whether clicking a folder link inside a restored chat from Workspace A (while Workspace B is currently visible in the sidebar) switches the file explorer to Workspace A or opens a scoped explorer popover for Workspace A.
-- [ ] Sign off on [`docs/contracts/file-reference-and-preview.md`](../contracts/file-reference-and-preview.md).
+- [x] Signed off on [`docs/contracts/file-reference-and-preview.md`](../contracts/file-reference-and-preview.md).

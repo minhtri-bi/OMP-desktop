@@ -1,0 +1,911 @@
+import type {
+  ChatLinkItem,
+  ChatThread,
+  ChatWorkspaceBinding,
+  DesktopBridgeApi,
+  FolderEntry,
+  LineAnchor,
+  ResolvedPreviewDescriptor,
+  SourceFileContent,
+  WorkspaceDescriptor,
+} from "../shared/contracts";
+import { PdfPreviewController } from "./pdf-viewer";
+
+declare global {
+  interface Window {
+    ompDesktop: DesktopBridgeApi;
+  }
+}
+
+interface OpenTab {
+  tabKey: string;
+  kind: "pdf" | "source" | "html-isolated-browser" | "browser";
+  title: string;
+  descriptor?: ResolvedPreviewDescriptor;
+  owningBinding?: ChatWorkspaceBinding;
+  sourceData?: SourceFileContent;
+  pdfBytes?: Uint8Array;
+  pdfPage?: number;
+  pdfTotalPages?: number;
+  pdfZoom?: number;
+  browserUrl?: string;
+  allowExternalNetwork?: boolean;
+}
+
+const api = window.ompDesktop;
+
+let workspaces: WorkspaceDescriptor[] = [];
+let activeWorkspaceId: string | null = null;
+let chats: ChatThread[] = [];
+let activeChatId = "";
+let openTabs: OpenTab[] = [];
+let activeTabKey: string | null = null;
+let browserTabCounter = 0;
+
+const expandedDirsByWorkspace = new Map<string, Set<string>>();
+
+const workspaceListEl = document.getElementById("workspace-list")!;
+const chatListEl = document.getElementById("chat-list")!;
+const explorerHeadingEl = document.getElementById("explorer-heading")!;
+const fileTreeEl = document.getElementById("file-tree")!;
+const activeChatTitleEl = document.getElementById("active-chat-title")!;
+const activeChatScopeEl = document.getElementById("active-chat-scope")!;
+const attachStandaloneBtn = document.getElementById("attach-standalone-btn")!;
+const linkErrorBannerEl = document.getElementById("link-error-banner")!;
+const linkErrorCodeEl = document.getElementById("link-error-code")!;
+const linkErrorMessageEl = document.getElementById("link-error-message")!;
+const dismissErrorBtn = document.getElementById("dismiss-error-btn")!;
+const chatTranscriptEl = document.getElementById("chat-transcript")!;
+const standaloneAttachmentsEl = document.getElementById("standalone-attachments")!;
+const composerForm = document.getElementById("composer-form") as HTMLFormElement;
+const composerInput = document.getElementById("composer-input") as HTMLTextAreaElement;
+const tabStripEl = document.getElementById("tab-strip")!;
+const breadcrumbsBarEl = document.getElementById("breadcrumbs-bar")!;
+const breadcrumbsNavEl = document.getElementById("breadcrumbs-nav")!;
+const breadcrumbSiblingsEl = document.getElementById("breadcrumb-siblings")!;
+const previewToolbarEl = document.getElementById("preview-toolbar")!;
+const previewEmptyEl = document.getElementById("preview-empty")!;
+const sourceViewerEl = document.getElementById("source-viewer")!;
+const pdfViewerEl = document.getElementById("pdf-viewer")!;
+const pdfCanvasEl = document.getElementById("pdf-canvas") as HTMLCanvasElement;
+const isolatedViewHostEl = document.getElementById("isolated-view-host")!;
+const openFolderBtn = document.getElementById("open-folder-btn")!;
+const newBrowserTabBtn = document.getElementById("new-browser-tab-btn")!;
+
+const pdfController = new PdfPreviewController(pdfCanvasEl);
+
+function getActiveChat(): ChatThread | undefined {
+  return chats.find((c) => c.chatId === activeChatId);
+}
+
+function getActiveWorkspace(): WorkspaceDescriptor | undefined {
+  return workspaces.find((w) => w.workspaceId === activeWorkspaceId);
+}
+
+function getActiveTab(): OpenTab | undefined {
+  return openTabs.find((t) => t.tabKey === activeTabKey);
+}
+
+function showError(code: string, message: string): void {
+  linkErrorCodeEl.textContent = code;
+  linkErrorMessageEl.textContent = message;
+  linkErrorBannerEl.classList.remove("hidden");
+}
+
+function clearError(): void {
+  linkErrorBannerEl.classList.add("hidden");
+  linkErrorCodeEl.textContent = "";
+  linkErrorMessageEl.textContent = "";
+}
+
+function hideSiblingPopover(): void {
+  breadcrumbSiblingsEl.classList.add("hidden");
+  breadcrumbSiblingsEl.innerHTML = "";
+}
+
+function getIsolatedHostBounds(): { x: number; y: number; width: number; height: number } {
+  const rect = isolatedViewHostEl.getBoundingClientRect();
+  return {
+    x: Math.round(rect.left),
+    y: Math.round(rect.top),
+    width: Math.round(rect.width),
+    height: Math.round(rect.height),
+  };
+}
+
+async function syncActiveIsolatedViewBounds(): Promise<void> {
+  const tab = getActiveTab();
+  if (!tab || (tab.kind !== "html-isolated-browser" && tab.kind !== "browser")) {
+    return;
+  }
+  if (!breadcrumbSiblingsEl.classList.contains("hidden")) {
+    await api.hideIsolatedViews();
+    return;
+  }
+  const bounds = getIsolatedHostBounds();
+  await api.setIsolatedViewBounds(tab.tabKey, bounds);
+}
+
+function renderWorkspaces(): void {
+  workspaceListEl.innerHTML = "";
+  for (const ws of workspaces) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = `nav-item${ws.workspaceId === activeWorkspaceId ? " active" : ""}`;
+    btn.dataset.testid = `workspace-item-${ws.workspaceId}`;
+    btn.title = ws.workspaceRoot;
+
+    const label = document.createElement("span");
+    label.textContent = ws.displayName;
+    const tag = document.createElement("span");
+    tag.className = "nav-item-meta";
+    tag.textContent = "folder";
+    btn.append(label, tag);
+
+    btn.addEventListener("click", async () => {
+      // Switching the visible sidebar project NEVER mutates the active chat's recorded workspace!
+      activeWorkspaceId = ws.workspaceId;
+      renderWorkspaces();
+      await renderFileTree();
+    });
+    workspaceListEl.append(btn);
+  }
+}
+
+function renderChatList(): void {
+  chatListEl.innerHTML = "";
+  for (const chat of chats) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = `nav-item${chat.chatId === activeChatId ? " active" : ""}`;
+    btn.dataset.testid = `chat-item-${chat.chatId}`;
+
+    const label = document.createElement("span");
+    label.textContent = chat.title;
+    const meta = document.createElement("span");
+    meta.className = "nav-item-meta";
+    meta.textContent =
+      chat.owningBinding.kind === "project" ? chat.owningBinding.workspaceDisplayName : "standalone";
+    btn.append(label, meta);
+
+    btn.addEventListener("click", () => {
+      const current = getActiveChat();
+      if (current) {
+        current.composerDraft = composerInput.value;
+      }
+      activeChatId = chat.chatId;
+      clearError();
+      renderChatList();
+      renderActiveChat();
+    });
+    chatListEl.append(btn);
+  }
+}
+
+async function renderFileTree(): Promise<void> {
+  const ws = getActiveWorkspace();
+  fileTreeEl.innerHTML = "";
+  if (!ws) {
+    explorerHeadingEl.textContent = "Explorer";
+    return;
+  }
+  explorerHeadingEl.textContent = `Explorer · ${ws.displayName}`;
+
+  if (!expandedDirsByWorkspace.has(ws.workspaceId)) {
+    expandedDirsByWorkspace.set(ws.workspaceId, new Set(["docs", "src", "web"]));
+  }
+  const expanded = expandedDirsByWorkspace.get(ws.workspaceId)!;
+
+  async function renderDir(relativeDir: string, depth: number): Promise<void> {
+    const entries: FolderEntry[] = await api.listDirectory(ws!.workspaceRoot, relativeDir);
+    for (const entry of entries) {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "tree-row";
+      row.style.paddingLeft = `${8 + depth * 14}px`;
+      row.dataset.testid = `tree-entry-${entry.relativePath}`;
+
+      const icon = document.createElement("span");
+      icon.className = "tree-icon";
+      const isExpanded = entry.isDirectory && expanded.has(entry.relativePath);
+      icon.textContent = entry.isDirectory ? (isExpanded ? "▾" : "▸") : "·";
+
+      const name = document.createElement("span");
+      name.textContent = entry.name;
+      row.append(icon, name);
+
+      row.addEventListener("click", async () => {
+        if (entry.isDirectory) {
+          if (expanded.has(entry.relativePath)) {
+            expanded.delete(entry.relativePath);
+          } else {
+            expanded.add(entry.relativePath);
+          }
+          await renderFileTree();
+          return;
+        }
+        const projectBinding: ChatWorkspaceBinding = {
+          kind: "project",
+          workspaceId: ws!.workspaceId,
+          workspaceRoot: ws!.workspaceRoot,
+          workspaceDisplayName: ws!.displayName,
+        };
+        await openFileReference({
+          chatId: activeChatId,
+          messageId: "file-tree",
+          isRestoredMessage: false,
+          owningBinding: projectBinding,
+          rawTarget: entry.relativePath,
+        });
+      });
+
+      fileTreeEl.append(row);
+      if (isExpanded) {
+        await renderDir(entry.relativePath, depth + 1);
+      }
+    }
+  }
+
+  await renderDir("", 0);
+}
+
+function renderActiveChat(): void {
+  const chat = getActiveChat();
+  if (!chat) return;
+
+  activeChatTitleEl.textContent = chat.title;
+  if (chat.owningBinding.kind === "project") {
+    activeChatScopeEl.textContent = `Workspace: ${chat.owningBinding.workspaceDisplayName}`;
+    activeChatScopeEl.classList.remove("standalone");
+    attachStandaloneBtn.classList.add("hidden");
+    standaloneAttachmentsEl.classList.add("hidden");
+    standaloneAttachmentsEl.innerHTML = "";
+  } else {
+    activeChatScopeEl.textContent = "Standalone (no project folder)";
+    activeChatScopeEl.classList.add("standalone");
+    attachStandaloneBtn.classList.remove("hidden");
+    standaloneAttachmentsEl.classList.remove("hidden");
+    standaloneAttachmentsEl.innerHTML = "";
+    for (const attached of chat.owningBinding.attachedCanonicalPaths) {
+      const pill = document.createElement("span");
+      pill.className = "attachment-pill";
+      pill.textContent = `Attached: ${attached.split(/[\\/]/).pop() ?? attached}`;
+      pill.title = attached;
+      standaloneAttachmentsEl.append(pill);
+    }
+  }
+
+  composerInput.value = chat.composerDraft;
+
+  chatTranscriptEl.innerHTML = "";
+  for (const msg of chat.messages) {
+    const card = document.createElement("article");
+    card.className = `message-card role-${msg.role}`;
+
+    const roleEl = document.createElement("div");
+    roleEl.className = "message-role";
+    roleEl.textContent = msg.isRestoredMessage ? `${msg.role} · restored` : msg.role;
+
+    const textEl = document.createElement("p");
+    textEl.className = "message-text";
+    textEl.textContent = msg.text;
+
+    card.append(roleEl, textEl);
+
+    if (msg.links && msg.links.length > 0) {
+      const chipList = document.createElement("div");
+      chipList.className = "chip-list";
+      for (const link of msg.links) {
+        const chip = document.createElement("button");
+        chip.type = "button";
+        chip.className = "file-chip";
+        chip.dataset.testid = `chat-link-${link.id}`;
+        // Untrusted-link protection: expose true target in tooltip so deceptive labels cannot disguise path
+        chip.title = link.anchor
+          ? `${link.rawTarget}#L${link.anchor.startLine}${link.anchor.endLine ? `-L${link.anchor.endLine}` : ""}`
+          : link.rawTarget;
+        chip.textContent = link.label;
+
+        chip.addEventListener("click", async () => {
+          await handleChatLinkClick(chat, msg.messageId, msg.isRestoredMessage, link);
+        });
+        chipList.append(chip);
+      }
+      card.append(chipList);
+    }
+
+    chatTranscriptEl.append(card);
+  }
+}
+
+async function handleChatLinkClick(
+  chat: ChatThread,
+  messageId: string,
+  isRestoredMessage: boolean,
+  link: ChatLinkItem,
+): Promise<void> {
+  if (link.kind === "external-url" || /^https?:\/\//i.test(link.rawTarget)) {
+    await openBrowserTab(link.rawTarget);
+    return;
+  }
+
+  await openFileReference({
+    chatId: chat.chatId,
+    messageId,
+    isRestoredMessage,
+    owningBinding: chat.owningBinding,
+    rawTarget: link.rawTarget,
+    anchor: link.anchor,
+  });
+}
+
+async function openFileReference(params: {
+  chatId: string;
+  messageId: string;
+  isRestoredMessage: boolean;
+  owningBinding: ChatWorkspaceBinding;
+  rawTarget: string;
+  anchor?: LineAnchor;
+  preferSourceView?: boolean;
+}): Promise<void> {
+  clearError();
+  hideSiblingPopover();
+
+  const resolved = await api.resolveAndOpenLink(params);
+  if (!resolved.ok) {
+    showError(resolved.code, resolved.message);
+    return;
+  }
+
+  const descriptor = resolved.descriptor;
+  if (descriptor.viewerKind === "folder-explorer") {
+    if (params.owningBinding.kind === "project") {
+      activeWorkspaceId = params.owningBinding.workspaceId;
+      const expanded =
+        expandedDirsByWorkspace.get(params.owningBinding.workspaceId) ?? new Set<string>();
+      expanded.add(descriptor.displayPath);
+      expandedDirsByWorkspace.set(params.owningBinding.workspaceId, expanded);
+      renderWorkspaces();
+      await renderFileTree();
+    }
+    return;
+  }
+
+  // Case-insensitive tab deduplication: second click focuses existing tab!
+  const existing = openTabs.find((t) => t.tabKey === descriptor.tabKey);
+  if (existing) {
+    if (params.anchor && existing.descriptor) {
+      existing.descriptor.anchor = params.anchor;
+    }
+    await activateTab(existing.tabKey);
+    return;
+  }
+
+  const title = descriptor.displayPath.split("/").pop() ?? descriptor.displayPath;
+  const newTab: OpenTab = {
+    tabKey: descriptor.tabKey,
+    kind: descriptor.viewerKind,
+    title: params.preferSourceView ? `${title} (source)` : title,
+    descriptor,
+    owningBinding: params.owningBinding,
+    allowExternalNetwork: false,
+  };
+
+  if (descriptor.viewerKind === "source") {
+    newTab.sourceData = await api.readSourceFile(descriptor.canonicalPath, params.owningBinding);
+  } else if (descriptor.viewerKind === "pdf") {
+    newTab.pdfBytes = await api.readPdfBytes(descriptor.canonicalPath, params.owningBinding);
+    newTab.pdfPage = 1;
+    newTab.pdfZoom = 1.0;
+  } else if (descriptor.viewerKind === "html-isolated-browser") {
+    newTab.browserUrl = descriptor.isolatedPreviewUrl;
+    newTab.allowExternalNetwork = false;
+  }
+
+  openTabs.push(newTab);
+  await activateTab(newTab.tabKey);
+}
+
+async function openBrowserTab(initialUrl = "about:blank"): Promise<void> {
+  clearError();
+  hideSiblingPopover();
+  browserTabCounter += 1;
+  const tabKey = `browser:${browserTabCounter}`;
+  const url = /^https?:\/\//i.test(initialUrl) ? initialUrl : "https://example.com";
+  const tab: OpenTab = {
+    tabKey,
+    kind: "browser",
+    title: "Browser",
+    browserUrl: url,
+    allowExternalNetwork: true,
+  };
+  openTabs.push(tab);
+  await activateTab(tabKey);
+}
+
+function renderTabStrip(): void {
+  tabStripEl.innerHTML = "";
+  for (const tab of openTabs) {
+    const item = document.createElement("div");
+    item.className = `tab-item${tab.tabKey === activeTabKey ? " active" : ""}`;
+    item.dataset.testid = "preview-tab-item";
+    item.dataset.tabKey = tab.tabKey;
+
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.role = "tab";
+    btn.className = "tab-btn";
+    btn.setAttribute("aria-selected", String(tab.tabKey === activeTabKey));
+    btn.dataset.testid = `preview-tab-${tab.tabKey}`;
+
+    const kindTag = document.createElement("span");
+    kindTag.className = "tab-kind-tag";
+    kindTag.textContent =
+      tab.kind === "html-isolated-browser" ? "html" : tab.kind === "browser" ? "web" : tab.kind;
+
+    const label = document.createElement("span");
+    label.textContent = tab.title;
+    btn.append(kindTag, label);
+    btn.addEventListener("click", async () => {
+      await activateTab(tab.tabKey);
+    });
+
+    const closeBtn = document.createElement("button");
+    closeBtn.type = "button";
+    closeBtn.className = "icon-btn";
+    closeBtn.setAttribute("aria-label", `Close ${tab.title}`);
+    closeBtn.textContent = "×";
+    closeBtn.addEventListener("click", async (ev) => {
+      ev.stopPropagation();
+      await closeTab(tab.tabKey);
+    });
+
+    item.append(btn, closeBtn);
+    tabStripEl.append(item);
+  }
+}
+
+function renderBreadcrumbs(tab: OpenTab): void {
+  hideSiblingPopover();
+  if (!tab.descriptor) {
+    breadcrumbsBarEl.classList.add("hidden");
+    return;
+  }
+
+  breadcrumbsBarEl.classList.remove("hidden");
+  breadcrumbsNavEl.innerHTML = "";
+  const crumbs = tab.descriptor.breadcrumbs;
+
+  crumbs.forEach((crumb, index) => {
+    if (index > 0) {
+      const sep = document.createElement("span");
+      sep.className = "crumb-sep";
+      sep.textContent = "/";
+      breadcrumbsNavEl.append(sep);
+    }
+
+    if (
+      tab.descriptor!.parentBrowsingAllowed &&
+      crumb.browsableRelativePath !== null &&
+      tab.owningBinding?.kind === "project"
+    ) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "crumb-btn";
+      btn.dataset.testid = `breadcrumb-browsable-${index}`;
+      btn.textContent = crumb.label;
+      const projectBinding = tab.owningBinding;
+      const targetRel = crumb.browsableRelativePath;
+      btn.addEventListener("click", async () => {
+        await toggleBreadcrumbSiblings(projectBinding, targetRel);
+      });
+      breadcrumbsNavEl.append(btn);
+    } else {
+      const span = document.createElement("span");
+      span.className = "crumb-static";
+      span.dataset.testid = `breadcrumb-static-${index}`;
+      span.textContent = crumb.label;
+      breadcrumbsNavEl.append(span);
+    }
+  });
+}
+
+async function toggleBreadcrumbSiblings(
+  projectBinding: Extract<ChatWorkspaceBinding, { kind: "project" }>,
+  relativeDir: string,
+): Promise<void> {
+  if (!breadcrumbSiblingsEl.classList.contains("hidden")) {
+    hideSiblingPopover();
+    await syncActiveIsolatedViewBounds();
+    return;
+  }
+
+  // Hide active isolated WebContentsView while popover is open to prevent HWND/overlay overlap
+  await api.hideIsolatedViews();
+  const entries = await api.listDirectory(projectBinding.workspaceRoot, relativeDir);
+  breadcrumbSiblingsEl.innerHTML = "";
+  for (const entry of entries) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "tree-row";
+    row.textContent = entry.isDirectory ? `▸ ${entry.name}/` : `· ${entry.name}`;
+    row.addEventListener("click", async () => {
+      hideSiblingPopover();
+      await openFileReference({
+        chatId: activeChatId,
+        messageId: "breadcrumb",
+        isRestoredMessage: false,
+        owningBinding: projectBinding,
+        rawTarget: entry.relativePath,
+      });
+    });
+    breadcrumbSiblingsEl.append(row);
+  }
+  breadcrumbSiblingsEl.classList.remove("hidden");
+}
+
+function renderSourceContent(tab: OpenTab): void {
+  sourceViewerEl.innerHTML = "";
+  const data = tab.sourceData;
+  if (!data) return;
+
+  const anchor = tab.descriptor?.anchor;
+  const lines = data.content.split(/\r?\n/);
+  let firstHighlighted: HTMLElement | null = null;
+
+  lines.forEach((text, idx) => {
+    const lineNo = idx + 1;
+    const isHighlighted =
+      anchor !== undefined &&
+      lineNo >= anchor.startLine &&
+      lineNo <= (anchor.endLine ?? anchor.startLine);
+
+    const row = document.createElement("div");
+    row.className = `source-line${isHighlighted ? " highlighted" : ""}`;
+    row.dataset.line = String(lineNo);
+
+    const gutter = document.createElement("span");
+    gutter.className = "source-gutter";
+    gutter.textContent = String(lineNo);
+
+    const code = document.createElement("span");
+    code.className = "source-code";
+    code.textContent = text;
+
+    row.append(gutter, code);
+    sourceViewerEl.append(row);
+    if (isHighlighted && !firstHighlighted) {
+      firstHighlighted = row;
+    }
+  });
+
+  if (firstHighlighted) {
+    (firstHighlighted as HTMLElement).scrollIntoView({ block: "center" });
+  }
+}
+
+function renderToolbar(tab: OpenTab): void {
+  previewToolbarEl.innerHTML = "";
+  previewToolbarEl.classList.remove("hidden");
+
+  if (tab.kind === "pdf") {
+    const navGroup = document.createElement("div");
+    navGroup.className = "toolbar-group";
+
+    const prevBtn = document.createElement("button");
+    prevBtn.type = "button";
+    prevBtn.className = "btn btn-subtle";
+    prevBtn.textContent = "Prev";
+    prevBtn.dataset.testid = "pdf-prev-page";
+
+    const pageIndicator = document.createElement("span");
+    pageIndicator.className = "toolbar-label";
+    pageIndicator.dataset.testid = "pdf-page-indicator";
+    pageIndicator.textContent = `Page ${tab.pdfPage ?? 1} / ${tab.pdfTotalPages ?? "?"}`;
+
+    const nextBtn = document.createElement("button");
+    nextBtn.type = "button";
+    nextBtn.className = "btn btn-subtle";
+    nextBtn.textContent = "Next";
+    nextBtn.dataset.testid = "pdf-next-page";
+
+    prevBtn.addEventListener("click", async () => {
+      const next = await pdfController.goToPage((tab.pdfPage ?? 1) - 1);
+      tab.pdfPage = next.currentPage;
+      tab.pdfTotalPages = next.totalPages;
+      renderToolbar(tab);
+    });
+    nextBtn.addEventListener("click", async () => {
+      const next = await pdfController.goToPage((tab.pdfPage ?? 1) + 1);
+      tab.pdfPage = next.currentPage;
+      tab.pdfTotalPages = next.totalPages;
+      renderToolbar(tab);
+    });
+
+    navGroup.append(prevBtn, pageIndicator, nextBtn);
+
+    const zoomGroup = document.createElement("div");
+    zoomGroup.className = "toolbar-group";
+
+    const zoomOutBtn = document.createElement("button");
+    zoomOutBtn.type = "button";
+    zoomOutBtn.className = "btn btn-subtle";
+    zoomOutBtn.textContent = "-";
+    zoomOutBtn.dataset.testid = "pdf-zoom-out";
+
+    const zoomIndicator = document.createElement("span");
+    zoomIndicator.className = "toolbar-label";
+    zoomIndicator.dataset.testid = "pdf-zoom-indicator";
+    zoomIndicator.textContent = `${Math.round((tab.pdfZoom ?? 1) * 100)}%`;
+
+    const zoomInBtn = document.createElement("button");
+    zoomInBtn.type = "button";
+    zoomInBtn.className = "btn btn-subtle";
+    zoomInBtn.textContent = "+";
+    zoomInBtn.dataset.testid = "pdf-zoom-in";
+
+    zoomOutBtn.addEventListener("click", async () => {
+      const next = await pdfController.setZoom((tab.pdfZoom ?? 1) - 0.25);
+      tab.pdfZoom = next.zoom;
+      renderToolbar(tab);
+    });
+    zoomInBtn.addEventListener("click", async () => {
+      const next = await pdfController.setZoom((tab.pdfZoom ?? 1) + 0.25);
+      tab.pdfZoom = next.zoom;
+      renderToolbar(tab);
+    });
+
+    zoomGroup.append(zoomOutBtn, zoomIndicator, zoomInBtn);
+    previewToolbarEl.append(navGroup, zoomGroup);
+    return;
+  }
+
+  if (tab.kind === "source") {
+    const left = document.createElement("div");
+    left.className = "toolbar-group";
+    const info = document.createElement("span");
+    info.className = "toolbar-label";
+    info.dataset.testid = "source-meta";
+    const anchorText = tab.descriptor?.anchor
+      ? ` · L${tab.descriptor.anchor.startLine}${tab.descriptor.anchor.endLine ? `-L${tab.descriptor.anchor.endLine}` : ""}`
+      : "";
+    info.textContent = `${tab.sourceData?.language ?? "text"} · ${tab.sourceData?.lineCount ?? 0} lines${anchorText}`;
+    left.append(info);
+    previewToolbarEl.append(left);
+    return;
+  }
+
+  if (tab.kind === "html-isolated-browser") {
+    const left = document.createElement("div");
+    left.className = "toolbar-group";
+    const originBadge = document.createElement("span");
+    originBadge.className = "toolbar-label";
+    originBadge.dataset.testid = "html-preview-origin";
+    originBadge.textContent = tab.browserUrl ?? "";
+    left.append(originBadge);
+
+    const right = document.createElement("div");
+    right.className = "toolbar-group";
+
+    const netToggleBtn = document.createElement("button");
+    netToggleBtn.type = "button";
+    netToggleBtn.className = "btn btn-subtle";
+    netToggleBtn.dataset.testid = "html-network-toggle";
+    netToggleBtn.textContent = tab.allowExternalNetwork
+      ? "External Network: Allowed"
+      : "External Network: Blocked";
+    netToggleBtn.addEventListener("click", async () => {
+      const res = await api.setIsolatedViewNetworkPolicy(tab.tabKey, !tab.allowExternalNetwork);
+      if (res.ok) {
+        tab.allowExternalNetwork = res.allowExternalNetwork;
+        renderToolbar(tab);
+      }
+    });
+
+    const viewSourceBtn = document.createElement("button");
+    viewSourceBtn.type = "button";
+    viewSourceBtn.className = "btn btn-subtle";
+    viewSourceBtn.dataset.testid = "html-view-source-btn";
+    viewSourceBtn.textContent = "View Source";
+    viewSourceBtn.addEventListener("click", async () => {
+      if (!tab.descriptor || !tab.owningBinding) return;
+      await openFileReference({
+        chatId: activeChatId,
+        messageId: "view-source",
+        isRestoredMessage: false,
+        owningBinding: tab.owningBinding,
+        rawTarget: tab.descriptor.canonicalPath,
+        preferSourceView: true,
+      });
+    });
+
+    right.append(netToggleBtn, viewSourceBtn);
+    previewToolbarEl.append(left, right);
+    return;
+  }
+
+  if (tab.kind === "browser") {
+    const form = document.createElement("form");
+    form.className = "toolbar-group";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "url-input";
+    input.value = tab.browserUrl ?? "";
+    input.dataset.testid = "browser-url-input";
+    const goBtn = document.createElement("button");
+    goBtn.type = "submit";
+    goBtn.className = "btn btn-subtle";
+    goBtn.textContent = "Go";
+    form.append(input, goBtn);
+
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      clearError();
+      const res = await api.navigateBrowserView(tab.tabKey, input.value.trim());
+      if (!res.ok) {
+        showError("BLOCKED_NAVIGATION", res.error);
+      } else {
+        tab.browserUrl = res.url;
+      }
+    });
+
+    const badge = document.createElement("span");
+    badge.className = "toolbar-label";
+    badge.textContent = "Isolated profile";
+    previewToolbarEl.append(form, badge);
+  }
+}
+
+async function activateTab(tabKey: string | null): Promise<void> {
+  activeTabKey = tabKey;
+  renderTabStrip();
+
+  const tab = getActiveTab();
+  if (!tab) {
+    await api.hideIsolatedViews();
+    breadcrumbsBarEl.classList.add("hidden");
+    previewToolbarEl.classList.add("hidden");
+    sourceViewerEl.classList.add("hidden");
+    pdfViewerEl.classList.add("hidden");
+    isolatedViewHostEl.classList.add("hidden");
+    previewEmptyEl.classList.remove("hidden");
+    return;
+  }
+
+  previewEmptyEl.classList.add("hidden");
+  renderBreadcrumbs(tab);
+  renderToolbar(tab);
+
+  if (tab.kind === "source") {
+    await api.hideIsolatedViews();
+    pdfViewerEl.classList.add("hidden");
+    isolatedViewHostEl.classList.add("hidden");
+    sourceViewerEl.classList.remove("hidden");
+    renderSourceContent(tab);
+    return;
+  }
+
+  if (tab.kind === "pdf") {
+    await api.hideIsolatedViews();
+    sourceViewerEl.classList.add("hidden");
+    isolatedViewHostEl.classList.add("hidden");
+    pdfViewerEl.classList.remove("hidden");
+    if (tab.pdfBytes) {
+      const state = await pdfController.loadBytes(tab.pdfBytes.slice());
+      tab.pdfPage = state.currentPage;
+      tab.pdfTotalPages = state.totalPages;
+      tab.pdfZoom = state.zoom;
+      renderToolbar(tab);
+    }
+    return;
+  }
+
+  if (tab.kind === "html-isolated-browser" || tab.kind === "browser") {
+    sourceViewerEl.classList.add("hidden");
+    pdfViewerEl.classList.add("hidden");
+    delete isolatedViewHostEl.dataset.viewReady;
+    isolatedViewHostEl.classList.remove("hidden");
+    // Wait one layout frame so isolatedViewHostEl has final non-zero bounds
+    await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+    const bounds = getIsolatedHostBounds();
+    const res = await api.openIsolatedView({
+      tabKey: tab.tabKey,
+      kind: tab.kind === "html-isolated-browser" ? "html-preview" : "browser",
+      url: tab.browserUrl ?? "about:blank",
+      workspaceToken: tab.descriptor?.workspaceToken,
+      allowExternalNetwork: tab.allowExternalNetwork ?? false,
+      bounds,
+    });
+    if (!res.ok) {
+      showError("PREVIEW_BLOCKED", res.error);
+    } else {
+      isolatedViewHostEl.dataset.viewReady = "true";
+    }
+  }
+}
+
+async function closeTab(tabKey: string): Promise<void> {
+  const idx = openTabs.findIndex((t) => t.tabKey === tabKey);
+  if (idx === -1) return;
+  const [removed] = openTabs.splice(idx, 1);
+  if (removed && (removed.kind === "html-isolated-browser" || removed.kind === "browser")) {
+    await api.closeIsolatedView(tabKey);
+  }
+  if (activeTabKey === tabKey) {
+    const next = openTabs[idx] ?? openTabs[idx - 1] ?? null;
+    await activateTab(next ? next.tabKey : null);
+  } else {
+    renderTabStrip();
+  }
+}
+
+dismissErrorBtn.addEventListener("click", () => clearError());
+
+openFolderBtn.addEventListener("click", async () => {
+  const ws = await api.openFolderDialog();
+  if (!ws) return;
+  if (!workspaces.some((w) => w.workspaceId === ws.workspaceId)) {
+    workspaces.push(ws);
+  }
+  activeWorkspaceId = ws.workspaceId;
+  renderWorkspaces();
+  await renderFileTree();
+});
+
+newBrowserTabBtn.addEventListener("click", async () => {
+  await openBrowserTab("https://example.com");
+});
+
+attachStandaloneBtn.addEventListener("click", async () => {
+  const chat = getActiveChat();
+  if (!chat || chat.owningBinding.kind !== "standalone") return;
+  const attachedPath = await api.attachStandaloneFileDialog(chat.chatId);
+  if (!attachedPath) return;
+  if (!chat.owningBinding.attachedCanonicalPaths.includes(attachedPath)) {
+    chat.owningBinding.attachedCanonicalPaths.push(attachedPath);
+  }
+  renderActiveChat();
+});
+
+composerForm.addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const chat = getActiveChat();
+  const text = composerInput.value.trim();
+  if (!chat || !text) return;
+  composerInput.value = "";
+  chat.composerDraft = "";
+  chat.messages.push({
+    messageId: `user-${Date.now()}`,
+    role: "user",
+    text,
+    isRestoredMessage: false,
+  });
+  renderActiveChat();
+  const res = await api.sendPrompt(chat.chatId, text);
+  if (!res.ok && res.error) {
+    showError("OMP_RUNTIME", res.error);
+  }
+});
+
+const resizeObserver = new ResizeObserver(() => {
+  void syncActiveIsolatedViewBounds();
+});
+resizeObserver.observe(isolatedViewHostEl);
+window.addEventListener("resize", () => {
+  void syncActiveIsolatedViewBounds();
+});
+
+async function boot(): Promise<void> {
+  const bootstrap = await api.getBootstrap();
+  workspaces = bootstrap.workspaces;
+  activeWorkspaceId = bootstrap.activeWorkspaceId;
+  chats = bootstrap.chats;
+  activeChatId = bootstrap.activeChatId;
+
+  renderWorkspaces();
+  renderChatList();
+  renderActiveChat();
+  await renderFileTree();
+}
+
+void boot();

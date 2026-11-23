@@ -1,6 +1,6 @@
 # Decision: OMP Runtime Integration (`omp-runtime`)
 
-- **Status**: Proposed (verified against pinned OMP `v19.1.1` source/docs and Windows CI RPC probe; awaiting integrator sign-off)
+- **Status**: Accepted (verified against pinned OMP `v19.1.1` source/docs and Windows CI RPC probe; default `--approval-mode always-ask`)
 - **Pinned runtime**: `can1357/oh-my-pi` `v19.1.1` (`omp-windows-x64.exe`, SHA-256 `4e18f472975bb87f9b1992f1d5981b9a1403fd559cdb3eb96f1f1a7d709096ef`)
 - **Contract companion**: [`docs/contracts/omp-adapter.md`](../contracts/omp-adapter.md)
 - **Reproducible probe**: [`scripts/probe-omp-rpc.ps1`](../../scripts/probe-omp-rpc.ps1)
@@ -98,5 +98,5 @@ The same zero-cost probe runs automatically on Windows (`windows-2022`) in [`.gi
 ## Open items before implementation
 
 - [ ] Confirm standalone-chat CWD ancestor walk-up boundary on Windows (`%LOCALAPPDATA%\OMPDesktop\standalone-cwd` with a `.git` sentinel vs `--no-extensions` / empty repo root).
-- [ ] Confirm whether MVP starts with `--approval-mode always-ask` or `always-ask-cached` as default.
-- [ ] Sign off on [`docs/contracts/omp-adapter.md`](../contracts/omp-adapter.md).
+- [x] Default approval mode locked to `--approval-mode always-ask` (owner decision).
+- [x] Signed off on [`docs/contracts/omp-adapter.md`](../contracts/omp-adapter.md).

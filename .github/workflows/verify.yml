@@ -18,7 +18,7 @@ jobs:
   windows-harness:
     name: Windows harness
     runs-on: windows-2022
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -40,3 +40,27 @@ jobs:
           $env:PI_CODING_AGENT_DIR = Join-Path $env:RUNNER_TEMP 'omp-harness-agent'
           ./scripts/check-harness.ps1 -OmpPath $ompPath
           ./scripts/probe-omp-rpc.ps1 -OmpPath $ompPath
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install, build, and verify Windows Electron app
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm ci --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { throw "npm ci failed with exit code $LASTEXITCODE." }
+          if (-not (Test-Path -LiteralPath 'node_modules/electron/dist/electron.exe')) {
+            node node_modules/electron/install.js
+            if ($LASTEXITCODE -ne 0) { throw "Electron binary install failed with exit code $LASTEXITCODE." }
+          }
+          npm run typecheck
+          if ($LASTEXITCODE -ne 0) { throw "typecheck failed with exit code $LASTEXITCODE." }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw "build failed with exit code $LASTEXITCODE." }
+          npm test
+          if ($LASTEXITCODE -ne 0) { throw "unit tests failed with exit code $LASTEXITCODE." }
+          npm run test:e2e
+          if ($LASTEXITCODE -ne 0) { throw "Windows Electron E2E tests failed with exit code $LASTEXITCODE." }

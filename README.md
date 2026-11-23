@@ -1,6 +1,6 @@
 # OMP Desktop
 
-A Windows-first workspace for local folders, standalone chat, project chat, and an embedded browser. OMP is the runtime, not another feature to rebuild. See the [design mind map](docs/design.md) for scope and decision order. No app framework or dependencies have been selected.
+A Windows-first workspace for local folders, standalone chat, project chat, and an embedded browser. OMP is the runtime, not another feature to rebuild. See the [design mind map](docs/design.md) for scope and decision order. Accepted desktop host: **Electron (`WebContentsView` + isolated session partitions)** with default OMP `--approval-mode always-ask` and default-blocked external network on local interactive HTML previews.
 
 ## Core interaction: open files from chat
 
@@ -54,7 +54,7 @@ Keep private progress receipts and generated graphs local. The PR is the review 
 
 ## Decision records and shared contracts
 
-Proposed decisions and draft contracts are ready for integrator sign-off before framework selection and implementation:
+Accepted decisions and frozen shared contracts governing the Electron MVP:
 
 | Slice | Decision record | Shared contract / artifacts |
 | --- | --- | --- |
@@ -62,20 +62,31 @@ Proposed decisions and draft contracts are ready for integrator sign-off before 
 | Desktop and browser host | [`docs/decisions/browser-host.md`](docs/decisions/browser-host.md) | [`docs/contracts/file-reference-and-preview.md`](docs/contracts/file-reference-and-preview.md) |
 | Folder and chat workflow | [`docs/decisions/workspace-ux.md`](docs/decisions/workspace-ux.md) | [`docs/contracts/file-reference-and-preview.md`](docs/contracts/file-reference-and-preview.md), [`tests/fixtures/`](tests/fixtures/README.md) |
 
-The first integrated path must open a folder and display files from its chat in the right-hand pane. Switching to standalone chat must preserve each chat's own context. Both use the same OMP adapter. Verify this flow in the running Windows app before broadening the surface.
+The first integrated path opens a folder and displays files from its chat in the right-hand pane. Switching to standalone chat preserves each chat's own context. Both use the same OMP adapter.
 
 ## Verification and delivery
 
-Run the same harness and zero-cost RPC probe checks as CI from PowerShell with `omp` and Git on `PATH`:
+Run the same harness, RPC probe, build, unit, and Electron acceptance checks as CI from PowerShell with `omp`, Node.js 22, and Git on `PATH`:
 
 ```powershell
 .\scripts\check-harness.ps1
 .\scripts\probe-omp-rpc.ps1
+npm ci
+npm run typecheck
+npm run build
+npm test
+npm run test:e2e
 ```
 
-The [Verify workflow](.github/workflows/verify.yml) runs on Windows for PRs targeting `main` and pushes to `main`. It verifies the SHA-256 of the pinned OMP release, checks the project and effective task/worktree settings (`task.isolation.apply`, `task.speculativeLaunch`, `worktree.clone`), checks `.gitignore` exclusion and tracked-file cleanliness for local coordination/worktree/graph/env paths, and runs the zero-cost OMP RPC protocol probe (`--mode rpc` and `--mode rpc-ui`). It does not start a worker, send a prompt, or build the app.
+To launch the desktop app locally on Windows:
 
-For every feature, name the new behavior and the existing behavior that must remain intact. Add the smallest deterministic check that protects each affected path. The first runnable app change must wire its real Windows build and core journey tests into this workflow. At minimum, test a restored chat opening a real file beside the same chat, link resolution after switching projects, and rejection of a path outside its workspace. Use isolated fixtures in [`tests/fixtures/`](tests/fixtures/README.md) and separately confirm native UI behavior in the running Windows app.
+```powershell
+npm start
+```
+
+The [Verify workflow](.github/workflows/verify.yml) runs on Windows (`windows-2022`) for PRs targeting `main` and pushes to `main`. It verifies the SHA-256 of the pinned OMP release, checks project/effective OMP task and worktree settings, checks `.gitignore` and tracked-file cleanliness, runs the zero-cost OMP RPC protocol probe (`--mode rpc` and `--mode rpc-ui`), and runs the Windows Electron typecheck, build, unit tests, and Playwright E2E acceptance suite (`ACC-01`–`ACC-08`) against isolated fixtures in [`tests/fixtures/`](tests/fixtures/README.md). It does not send any paid LLM prompts.
+
+For every feature, name the new behavior and the existing behavior that must remain intact. Add the smallest deterministic check that protects each affected path, and separately confirm native UI behavior in the running Windows app.
 
 After the local check, commit owned changes with OMP's selective commit tool (or scoped `git add <owned-paths> && git commit` when local OMP extensions are unavailable). Push the task branch to the approved `origin`, then open or update one PR targeting `main` with the [review template](.github/pull_request_template.md). The project owner reviews and merges. If `origin/main` does not exist, ask the owner to authorize its initial seed; do not push the task branch first and accidentally set it as the default.
 
