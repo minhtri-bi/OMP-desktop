@@ -73,6 +73,7 @@ Key approval and UI behaviors verified in `docs/approval-mode.md` and `docs/rpc.
 
 | Capability | Behavior in OMP `v19.1.1` RPC | Desktop handling |
 | --- | --- | --- |
+| Starting RPC with zero configured models / credentials | Fails closed before `ready`: `main.ts` (`!isInteractive && !session.model`) exits `1` with `No default model selected` | Detect exit code `1` before `ready` as `NO_CONFIGURED_MODEL` and guide the user to run `omp /login`, set an API key, or configure `models.yml` (do not assume RPC `login` can bootstrap an unconfigured install) |
 | `@file` CLI arguments | Rejected in RPC mode | Pass explicit user attachments via prompt payload / host contract, never CLI `@file` |
 | Terminal-only UI (component factories, custom headers/footers/editors, raw terminal input, autocomplete, TUI theme switching, tool expansion) | Unsupported (`getEditorText()` returns `""`) | Render native desktop UI from structured RPC events |
 | Pre-URL secret login prompts | Unsupported in RPC `login` | Surface provider status and let user authenticate via OAuth `open_url` or `omp` CLI for unsupported flows |
@@ -88,8 +89,9 @@ Run locally on Windows PowerShell with `omp` on `PATH` (no API key, no prompt, n
 ```
 
 The probe verifies on pinned `omp-windows-x64.exe` `v19.1.1`:
-1. `--mode rpc --no-session --approval-mode always-ask`: `ready` frame (`protocolVersion: 1`, `supportedProtocolVersions` contains `2`, `maxFrameBytes: 1048576`, `maxReassembledFrameBytes: 67108864`), `negotiate_protocol` v2, `get_state` (`isStreaming: false`), `get_available_commands`, `get_messages_page`, malformed JSON recoverable `command: "parse"` error followed by successful `get_state`, and clean `stdin` EOF exit code `0`.
-2. `--mode rpc-ui --no-session --approval-mode always-ask`: `ready` frame, `negotiate_protocol` v2, `get_state`, and clean `stdin` EOF exit code `0`.
+1. **Unconfigured install gate**: with an empty isolated `PI_CODING_AGENT_DIR` and no API keys, `--mode rpc` exits non-zero before `ready` with `No default model selected`.
+2. **`--mode rpc`** (with an isolated offline dummy `models.yml` using `auth: none` and unreachable loopback `http://127.0.0.1:1/v1`, zero prompts sent): `ready` frame (`protocolVersion: 1`, `supportedProtocolVersions` contains `2`, `maxFrameBytes: 1048576`, `maxReassembledFrameBytes: 67108864`), `negotiate_protocol` v2, `get_state` (`isStreaming: false`), `get_available_commands`, `get_messages_page`, malformed JSON recoverable `command: "parse"` error followed by successful `get_state`, and clean `stdin` EOF exit code `0`.
+3. **`--mode rpc-ui`** (same isolated offline dummy model, zero prompts sent): `ready` frame, `negotiate_protocol` v2, `get_state`, and clean `stdin` EOF exit code `0`.
 
 The same zero-cost probe runs automatically on Windows (`windows-2022`) in [`.github/workflows/verify.yml`](../../.github/workflows/verify.yml).
 

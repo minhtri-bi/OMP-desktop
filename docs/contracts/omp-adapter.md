@@ -122,7 +122,7 @@ export type OmpAdapterEvent =
   | { type: "open_url"; url: string; launchUrl?: string; instructions?: string }
   | { type: "notify"; message: string; level?: string }
   | { type: "available_commands_update"; commands: unknown[] }
-  | { type: "transport_error"; code: "PARSE_ERROR" | "CHUNK_PROTOCOL_ERROR" | "FRAME_OVERFLOW" | "PROCESS_EXITED"; message: string; recoverable: boolean };
+  | { type: "transport_error"; code: "NO_CONFIGURED_MODEL" | "PARSE_ERROR" | "CHUNK_PROTOCOL_ERROR" | "FRAME_OVERFLOW" | "PROCESS_EXITED"; message: string; recoverable: boolean };
 
 export interface OmpAdapter {
   start(config: OmpProcessConfig): Promise<OmpReadyMetadata>;

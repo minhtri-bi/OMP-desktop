@@ -14,6 +14,62 @@ function Resolve-OmpExecutable {
     return $cmd.Source
 }
 
+function Test-UnconfiguredRpcFailsFast {
+    param(
+        [Parameter(Mandatory)][string]$ResolvedOmpPath,
+        [Parameter(Mandatory)][int]$TimeoutSeconds
+    )
+
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('omp-rpc-unconfigured-' + [System.Guid]::NewGuid().ToString('N'))
+    $probeCwd = Join-Path $tempRoot 'cwd'
+    $probeAgentDir = Join-Path $tempRoot 'agent'
+    New-Item -ItemType Directory -Path $probeCwd, $probeAgentDir -Force | Out-Null
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $ResolvedOmpPath
+    $psi.Arguments = '--mode rpc --no-session --approval-mode always-ask'
+    $psi.WorkingDirectory = $probeCwd
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = New-Object System.Text.UTF8Encoding($false)
+    $psi.StandardErrorEncoding = New-Object System.Text.UTF8Encoding($false)
+    $psi.EnvironmentVariables['PI_CODING_AGENT_DIR'] = $probeAgentDir
+    $psi.EnvironmentVariables.Remove('OMP_PROFILE')
+    $psi.EnvironmentVariables.Remove('PI_PROFILE')
+    foreach ($key in 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'OPENROUTER_API_KEY') {
+        $psi.EnvironmentVariables.Remove($key)
+    }
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $psi
+
+    try {
+        if (-not $process.Start()) {
+            throw "Failed to start $ResolvedOmpPath for unconfigured startup probe."
+        }
+        $process.StandardInput.Close()
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            throw 'Timed out waiting for unconfigured OMP RPC process to exit.'
+        }
+        $stderr = $stderrTask.Result
+        $stdout = $stdoutTask.Result
+        if ($process.ExitCode -eq 0 -or $stderr -notmatch 'No default model selected') {
+            throw "Expected non-zero exit with 'No default model selected' when unconfigured, got exitCode=$($process.ExitCode), stdout=$stdout, stderr=$stderr"
+        }
+        Write-Output "[unconfigured] verified pre-ready fail-fast: exitCode=$($process.ExitCode) (No default model selected)"
+    } finally {
+        if (-not $process.HasExited) {
+            try { $process.Kill() } catch {}
+        }
+        $process.Dispose()
+        Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Invoke-OmpRpcProbe {
     param(
         [Parameter(Mandatory)][string]$ResolvedOmpPath,
@@ -27,9 +83,36 @@ function Invoke-OmpRpcProbe {
     $probeAgentDir = Join-Path $tempRoot 'agent'
     New-Item -ItemType Directory -Path $probeCwd, $probeAgentDir -Force | Out-Null
 
+    # OMP v19.1.1 requires a selectable model to enter non-interactive RPC mode.
+    # Use an isolated offline dummy provider (auth: none, unreachable loopback port 1); no prompt is ever sent.
+    $offlineModelsYaml = @"
+providers:
+  offline-probe:
+    baseUrl: http://127.0.0.1:1/v1
+    api: openai-completions
+    auth: none
+    models:
+      - id: offline-probe-model
+        name: Offline Probe Model
+        reasoning: false
+        input: [text]
+        cost:
+          input: 0
+          output: 0
+          cacheRead: 0
+          cacheWrite: 0
+        contextWindow: 128000
+        maxTokens: 4096
+"@
+    [System.IO.File]::WriteAllText(
+        (Join-Path $probeAgentDir 'models.yml'),
+        $offlineModelsYaml,
+        (New-Object System.Text.UTF8Encoding($false))
+    )
+
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $ResolvedOmpPath
-    $psi.Arguments = "--mode $Mode --no-session --approval-mode always-ask"
+    $psi.Arguments = "--mode $Mode --no-session --approval-mode always-ask --model offline-probe/offline-probe-model"
     $psi.WorkingDirectory = $probeCwd
     $psi.UseShellExecute = $false
     $psi.RedirectStandardInput = $true
@@ -200,5 +283,6 @@ if ($LASTEXITCODE -ne 0) {
     throw "OMP version check failed with exit code $LASTEXITCODE."
 }
 
+Test-UnconfiguredRpcFailsFast -ResolvedOmpPath $resolvedOmp -TimeoutSeconds $TimeoutSeconds
 Invoke-OmpRpcProbe -ResolvedOmpPath $resolvedOmp -Mode 'rpc' -TimeoutSeconds $TimeoutSeconds -IncludeRecoveryChecks
 Invoke-OmpRpcProbe -ResolvedOmpPath $resolvedOmp -Mode 'rpc-ui' -TimeoutSeconds $TimeoutSeconds
