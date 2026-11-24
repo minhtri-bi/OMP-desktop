@@ -36,6 +36,9 @@ const bridge: DesktopBridgeApi = {
   sendPrompt: (chatId: string, text: string) =>
     ipcRenderer.invoke("omp-desktop:send-prompt", chatId, text),
   abortTurn: (chatId: string) => ipcRenderer.invoke("omp-desktop:abort-turn", chatId),
+  respondToDialog: (chatId, response) =>
+    ipcRenderer.invoke("omp-desktop:respond-dialog", chatId, response),
+  syncUiState: (update) => ipcRenderer.invoke("omp-desktop:sync-ui-state", update),
   onOmpEvent: (listener: (event: { chatId: string; event: OmpAdapterEvent }) => void) => {
     const wrapped = (_ev: Electron.IpcRendererEvent, payload: { chatId: string; event: OmpAdapterEvent }) => {
       listener(payload);

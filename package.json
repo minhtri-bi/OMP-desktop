@@ -12,6 +12,7 @@
     "test:e2e": "playwright test"
   },
   "dependencies": {
+    "koffi": "3.3.8",
     "pdfjs-dist": "6.5.438"
   },
   "devDependencies": {

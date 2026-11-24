@@ -8,12 +8,15 @@ import type {
   ChatWorkspaceBinding,
   FolderEntry,
   MessageFileLinkRequest,
+  OmpDialogResponse,
   PathResolutionResult,
   PreviewBounds,
   RuntimeDiagnostics,
   SourceFileContent,
   WorkspaceDescriptor,
 } from "../shared/contracts";
+import { parseReplyLinks } from "../shared/link-parser";
+import { extractAssistantText, extractStreamingUpdateText } from "../shared/omp-message";
 import { OmpRuntimeAdapter } from "./omp-adapter";
 import {
   authorizeCanonicalReadPath,
@@ -22,6 +25,7 @@ import {
   resolveMessageFileLink,
 } from "./path-resolver";
 import { IsolatedPreviewManager, registerPreviewProtocolScheme } from "./preview-manager";
+import { DesktopStateStore } from "./state-store";
 
 // Must be called synchronously BEFORE app.whenReady()
 registerPreviewProtocolScheme();
@@ -31,7 +35,9 @@ const MAX_PDF_BYTES = 50 * 1024 * 1024;
 
 let mainWindow: BrowserWindow | null = null;
 let previewManager: IsolatedPreviewManager | null = null;
+let stateStore: DesktopStateStore | null = null;
 const adaptersByChatId = new Map<string, OmpRuntimeAdapter>();
+const startingAdaptersByChatId = new Map<string, Promise<OmpRuntimeAdapter>>();
 
 const workspaces = new Map<string, WorkspaceDescriptor>();
 const chats = new Map<string, ChatThread>();
@@ -46,6 +52,22 @@ const diagnostics: RuntimeDiagnostics = {
   attachmentUploadCount: 0,
   lastError: null,
 };
+
+function persistState(): void {
+  if (!stateStore) {
+    return;
+  }
+  try {
+    stateStore.save({
+      workspaces: Array.from(workspaces.values()),
+      activeWorkspaceId,
+      chats: Array.from(chats.values()),
+      activeChatId,
+    });
+  } catch (err) {
+    diagnostics.lastError = err instanceof Error ? err.message : String(err);
+  }
+}
 
 function languageForPath(filePath: string): string {
   const ext = path.extname(filePath).toLowerCase();
@@ -76,7 +98,12 @@ function addWorkspace(rootPath: string, explicitId?: string, explicitName?: stri
       return existing;
     }
   }
-  const workspaceId = explicitId ?? `ws-${workspaces.size + 1}`;
+  let workspaceId = explicitId ?? `ws-${workspaces.size + 1}`;
+  let seq = workspaces.size + 1;
+  while (!explicitId && workspaces.has(workspaceId)) {
+    seq += 1;
+    workspaceId = `ws-${seq}`;
+  }
   const displayName = explicitName ?? path.basename(canonicalRoot);
   const descriptor: WorkspaceDescriptor = {
     workspaceId,
@@ -88,6 +115,21 @@ function addWorkspace(rootPath: string, explicitId?: string, explicitName?: stri
 }
 
 function initializeFixtureOrDefaultState(): void {
+  const persisted = stateStore?.load();
+  if (persisted) {
+    workspaces.clear();
+    for (const ws of persisted.workspaces) {
+      workspaces.set(ws.workspaceId, ws);
+    }
+    chats.clear();
+    for (const chat of persisted.chats) {
+      chats.set(chat.chatId, chat);
+    }
+    activeWorkspaceId = persisted.activeWorkspaceId;
+    activeChatId = persisted.activeChatId;
+    return;
+  }
+
   const fixtureRootEnv = process.env.OMP_DESKTOP_FIXTURE_ROOT;
   const repoRoot = path.resolve(__dirname, "..", "..");
   const candidateFixturesDir = fixtureRootEnv
@@ -230,7 +272,12 @@ function getOrCreateProjectChat(ws: WorkspaceDescriptor, forceNew = false): Chat
       }
     }
   }
-  const chatId = `chat-${ws.workspaceId}-${chats.size + 1}`;
+  let seq = chats.size + 1;
+  let chatId = `chat-${ws.workspaceId}-${seq}`;
+  while (chats.has(chatId)) {
+    seq += 1;
+    chatId = `chat-${ws.workspaceId}-${seq}`;
+  }
   const chat: ChatThread = {
     chatId,
     title: `${ws.displayName} Chat`,
@@ -278,6 +325,7 @@ function registerIpcHandlers(): void {
       const chat = getOrCreateProjectChat(ws, false);
       activeWorkspaceId = ws.workspaceId;
       activeChatId = chat.chatId;
+      persistState();
       return { workspace: ws, chat };
     },
   );
@@ -289,6 +337,7 @@ function registerIpcHandlers(): void {
       if (!ws) return null;
       const chat = getOrCreateProjectChat(ws, true);
       activeChatId = chat.chatId;
+      persistState();
       return chat;
     },
   );
@@ -473,6 +522,7 @@ function registerIpcHandlers(): void {
         )
       ) {
         chat.owningBinding.attachedCanonicalPaths.push(canonical);
+        persistState();
       }
       return canonical;
     },
@@ -494,33 +544,150 @@ function registerIpcHandlers(): void {
     if (!chat) {
       return { ok: false, error: "Unknown chat thread." };
     }
-    const ompBin = process.env.OMP_DESKTOP_OMP_PATH || "omp";
-    let ompArgsPrefix: string[] | undefined;
-    if (process.env.OMP_DESKTOP_OMP_ARGS_PREFIX) {
-      try {
-        const parsed = JSON.parse(process.env.OMP_DESKTOP_OMP_ARGS_PREFIX) as unknown;
-        if (Array.isArray(parsed) && parsed.every((item) => typeof item === "string")) {
-          ompArgsPrefix = parsed;
-        }
-      } catch {
-        // ignore malformed optional test override
-      }
+    const trimmed = text.trim();
+    if (!trimmed) {
+      return { ok: false, error: "Prompt text cannot be empty." };
     }
-    let adapter = adaptersByChatId.get(chatId);
-    if (!adapter) {
-      adapter = new OmpRuntimeAdapter();
-      adapter.onEvent((ev) => {
-        if (ev.type === "ready") {
-          diagnostics.ompStatus = "ready";
-          diagnostics.ompVersion = ev.metadata.ompVersion;
-        } else if (ev.type === "transport_error" && ev.code === "NO_CONFIGURED_MODEL") {
-          diagnostics.ompStatus = "no-configured-model";
-          diagnostics.lastError = ev.message;
+
+    // Record user turn and clear persisted draft immediately
+    chat.messages.push({
+      messageId: `user-${Date.now()}-${chat.messages.length}`,
+      role: "user",
+      text: trimmed,
+      isRestoredMessage: false,
+    });
+    chat.composerDraft = "";
+    persistState();
+
+    const ensureRunningAdapter = async (): Promise<OmpRuntimeAdapter> => {
+      const existing = adaptersByChatId.get(chatId);
+      if (existing && existing.isRunning()) {
+        return existing;
+      }
+      if (existing) {
+        diagnostics.promptRequestCount += existing.getPromptRequestCount();
+        adaptersByChatId.delete(chatId);
+        await existing.dispose();
+      }
+
+      const inflight = startingAdaptersByChatId.get(chatId);
+      if (inflight) {
+        return inflight;
+      }
+
+      const startPromise = (async () => {
+        if (chat.owningBinding.kind === "project") {
+          const rootCandidate = chat.owningBinding.workspaceRoot;
+          if (rootCandidate.startsWith("\\\\") || rootCandidate.startsWith("//")) {
+            throw new Error("Owning workspace uses an unsupported UNC or device path.");
+          }
+          let rootLs: fs.Stats;
+          try {
+            rootLs = fs.lstatSync(rootCandidate);
+          } catch {
+            throw new Error(
+              `Owning workspace "${chat.owningBinding.workspaceDisplayName}" is no longer available on disk.`,
+            );
+          }
+          if (rootLs.isSymbolicLink() || !rootLs.isDirectory()) {
+            throw new Error(
+              `Owning workspace "${chat.owningBinding.workspaceDisplayName}" is not a valid local directory.`,
+            );
+          }
         }
-        mainWindow?.webContents.send("omp-desktop:omp-event", { chatId, event: ev });
-      });
-      const standaloneCwd = path.join(app.getPath("userData"), "standalone-cwd");
-      try {
+
+        const ompBin = process.env.OMP_DESKTOP_OMP_PATH || "omp";
+        let ompArgsPrefix: string[] | undefined;
+        if (process.env.OMP_DESKTOP_OMP_ARGS_PREFIX) {
+          try {
+            const parsed = JSON.parse(process.env.OMP_DESKTOP_OMP_ARGS_PREFIX) as unknown;
+            if (Array.isArray(parsed) && parsed.every((item) => typeof item === "string")) {
+              ompArgsPrefix = parsed;
+            }
+          } catch {
+            // ignore malformed optional test override
+          }
+        }
+
+        const adapter = new OmpRuntimeAdapter();
+        let adapterPartialText = "";
+        adapter.onEvent((ev) => {
+          if (ev.type === "ready") {
+            diagnostics.ompStatus = "ready";
+            diagnostics.ompVersion = ev.metadata.ompVersion;
+          } else if (ev.type === "message_update") {
+            const next = extractStreamingUpdateText(ev.payload, adapterPartialText);
+            if (next !== null) {
+              adapterPartialText = next;
+            }
+          } else if (ev.type === "message_end") {
+            adapterPartialText = "";
+            const targetChat = chats.get(chatId);
+            const extracted = extractAssistantText(ev.message);
+            if (targetChat && extracted) {
+              const messageId = `omp-${Date.now()}-${targetChat.messages.length}`;
+              const parsedLinks = parseReplyLinks(extracted.text, messageId);
+              targetChat.messages.push({
+                messageId,
+                role: extracted.role,
+                text: extracted.text,
+                links: parsedLinks.length > 0 ? parsedLinks : undefined,
+                isRestoredMessage: false,
+              });
+              persistState();
+            }
+          } else if (ev.type === "prompt_result") {
+            const trimmedPartial = adapterPartialText.trim();
+            adapterPartialText = "";
+            if (ev.status === "aborted") {
+              const targetChat = chats.get(chatId);
+              if (targetChat) {
+                if (trimmedPartial.length > 0) {
+                  const messageId = `omp-aborted-${Date.now()}-${targetChat.messages.length}`;
+                  const parsedLinks = parseReplyLinks(trimmedPartial, messageId);
+                  targetChat.messages.push({
+                    messageId,
+                    role: "assistant",
+                    text: `${trimmedPartial}\n\n[Turn aborted]`,
+                    links: parsedLinks.length > 0 ? parsedLinks : undefined,
+                    isRestoredMessage: false,
+                  });
+                } else {
+                  targetChat.messages.push({
+                    messageId: `sys-aborted-${Date.now()}-${targetChat.messages.length}`,
+                    role: "system",
+                    text: "Turn aborted.",
+                    isRestoredMessage: false,
+                  });
+                }
+                persistState();
+              }
+            }
+          } else if (ev.type === "session_settled") {
+            adapterPartialText = "";
+          } else if (ev.type === "transport_error") {
+            if (!ev.recoverable) {
+              adapterPartialText = "";
+            }
+            if (ev.code === "NO_CONFIGURED_MODEL") {
+              diagnostics.ompStatus = "no-configured-model";
+              diagnostics.lastError = ev.message;
+            } else if (!ev.recoverable) {
+              diagnostics.ompStatus = "error";
+              diagnostics.lastError = ev.message;
+            }
+            if (!ev.recoverable && adaptersByChatId.get(chatId) === adapter) {
+              diagnostics.promptRequestCount += adapter.getPromptRequestCount();
+              adaptersByChatId.delete(chatId);
+            }
+          }
+          mainWindow?.webContents.send("omp-desktop:omp-event", { chatId, event: ev });
+        });
+
+        const standaloneCwd = path.join(app.getPath("userData"), "standalone-cwd");
+        const safeSessionKey = chatId.replace(/[^a-zA-Z0-9._-]/g, "_");
+        const sessionDir = path.join(app.getPath("userData"), "omp-sessions", safeSessionKey);
+
         await adapter.start({
           ompExecutablePath: ompBin,
           ompArgsPrefix,
@@ -529,26 +696,41 @@ function registerIpcHandlers(): void {
               ? {
                   kind: "project",
                   workspaceId: chat.owningBinding.workspaceId,
-                  canonicalWorkspaceRoot: chat.owningBinding.workspaceRoot,
+                  canonicalWorkspaceRoot: canonicalizeExistingPath(chat.owningBinding.workspaceRoot),
                 }
               : {
                   kind: "standalone",
                   standaloneCwd,
                 },
           approvalMode: "always-ask",
+          sessionDir,
           supportsFormDialog: false,
+          supportsAskDialog: true,
           requireProtocolV2: true,
           shutdownTimeoutMs: 5_000,
         });
         adaptersByChatId.set(chatId, adapter);
-      } catch (err) {
-        diagnostics.lastError = err instanceof Error ? err.message : String(err);
-        return { ok: false, error: diagnostics.lastError };
+        return adapter;
+      })();
+
+      startingAdaptersByChatId.set(chatId, startPromise);
+      try {
+        return await startPromise;
+      } finally {
+        startingAdaptersByChatId.delete(chatId);
       }
+    };
+
+    let adapter: OmpRuntimeAdapter;
+    try {
+      adapter = await ensureRunningAdapter();
+    } catch (err) {
+      diagnostics.lastError = err instanceof Error ? err.message : String(err);
+      return { ok: false, error: diagnostics.lastError };
     }
 
     try {
-      await adapter.sendPrompt(text);
+      await adapter.sendPrompt(trimmed);
       return { ok: true };
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -557,10 +739,64 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle("omp-desktop:abort-turn", async (_event, chatId: string) => {
     const adapter = adaptersByChatId.get(chatId);
-    if (adapter) {
+    if (adapter && adapter.isRunning()) {
       await adapter.abort();
     }
   });
+
+  ipcMain.handle(
+    "omp-desktop:respond-dialog",
+    async (_event, chatId: string, response: OmpDialogResponse) => {
+      if (!response || typeof response !== "object" || typeof response.id !== "string" || !response.id) {
+        return { ok: false, error: "Invalid dialog response payload." };
+      }
+      const adapter = adaptersByChatId.get(chatId);
+      if (!adapter || !adapter.isRunning()) {
+        return { ok: false, error: "OMP runtime is not active for this chat." };
+      }
+      try {
+        await adapter.respondToDialog(response);
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    "omp-desktop:sync-ui-state",
+    (
+      _event,
+      update: {
+        activeWorkspaceId?: string | null;
+        activeChatId?: string;
+        draftUpdate?: { chatId: string; draft: string };
+      },
+    ) => {
+      if (!update || typeof update !== "object") {
+        return;
+      }
+      if (update.activeWorkspaceId !== undefined) {
+        if (update.activeWorkspaceId === null || workspaces.has(update.activeWorkspaceId)) {
+          activeWorkspaceId = update.activeWorkspaceId;
+        }
+      }
+      if (typeof update.activeChatId === "string" && chats.has(update.activeChatId)) {
+        activeChatId = update.activeChatId;
+      }
+      if (
+        update.draftUpdate &&
+        typeof update.draftUpdate.chatId === "string" &&
+        typeof update.draftUpdate.draft === "string"
+      ) {
+        const target = chats.get(update.draftUpdate.chatId);
+        if (target) {
+          target.composerDraft = update.draftUpdate.draft;
+        }
+      }
+      persistState();
+    },
+  );
 }
 
 async function createMainWindow(): Promise<void> {
@@ -606,6 +842,7 @@ app.whenReady().then(async () => {
   if (process.env.OMP_DESKTOP_USER_DATA) {
     app.setPath("userData", path.resolve(process.env.OMP_DESKTOP_USER_DATA));
   }
+  stateStore = new DesktopStateStore(app.getPath("userData"));
   initializeFixtureOrDefaultState();
   registerIpcHandlers();
   await createMainWindow();
@@ -622,6 +859,7 @@ app.on("before-quit", (event) => {
     return;
   }
   quitPhase = "disposing";
+  persistState();
   previewManager?.disposeAll();
   const activeAdapters = Array.from(adaptersByChatId.values());
   adaptersByChatId.clear();

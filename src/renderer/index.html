@@ -43,6 +43,14 @@
           <section class="sidebar-section">
             <div class="section-header">
               <h2>Chats</h2>
+              <button
+                id="new-project-chat-btn"
+                class="btn-inline hidden"
+                type="button"
+                data-testid="new-project-chat-btn"
+              >
+                + New
+              </button>
             </div>
             <div id="chat-list" class="item-list" data-testid="chat-list"></div>
           </section>
@@ -82,7 +90,11 @@
             </button>
           </div>
 
+          <div id="onboarding-slot" data-testid="onboarding-slot"></div>
+
           <div id="chat-transcript" class="chat-transcript" data-testid="chat-transcript"></div>
+
+          <div id="chat-dialogs" class="chat-dialogs hidden" data-testid="chat-dialogs"></div>
 
           <form id="composer-form" class="composer" data-testid="composer-form">
             <div id="standalone-attachments" class="attachment-strip hidden" data-testid="standalone-attachments"></div>
@@ -94,9 +106,19 @@
                 placeholder="Message OMP (runtime approval mode: always-ask)..."
                 data-testid="composer-input"
               ></textarea>
-              <button id="composer-send-btn" class="btn btn-primary" type="submit" data-testid="composer-send-btn">
-                Send
-              </button>
+              <div class="composer-actions">
+                <button
+                  id="composer-abort-btn"
+                  class="btn btn-danger hidden"
+                  type="button"
+                  data-testid="composer-abort-btn"
+                >
+                  Stop
+                </button>
+                <button id="composer-send-btn" class="btn btn-primary" type="submit" data-testid="composer-send-btn">
+                  Send
+                </button>
+              </div>
             </div>
           </form>
         </main>

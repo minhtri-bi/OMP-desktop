@@ -5,11 +5,19 @@ import type {
   DesktopBridgeApi,
   FolderEntry,
   LineAnchor,
+  OmpDialogRequest,
   ResolvedPreviewDescriptor,
   SourceFileContent,
   WorkspaceDescriptor,
 } from "../shared/contracts";
 import { parseReplyLinks } from "../shared/link-parser";
+import { extractAssistantText, extractStreamingUpdateText } from "../shared/omp-message";
+import {
+  buildNoConfiguredModelCard,
+  buildOmpDialogCard,
+  buildOpenUrlCard,
+  type OpenUrlPromptItem,
+} from "./dialog-cards";
 import { PdfPreviewController } from "./pdf-viewer";
 
 declare global {
@@ -44,9 +52,17 @@ let activeTabKey: string | null = null;
 let browserTabCounter = 0;
 
 const expandedDirsByWorkspace = new Map<string, Set<string>>();
+const turnActiveChats = new Set<string>();
+const streamingTextByChatId = new Map<string, string>();
+const pendingDialogsByChatId = new Map<string, OmpDialogRequest[]>();
+const pendingOpenUrlByChatId = new Map<string, OpenUrlPromptItem>();
+const unconfiguredModelChatIds = new Set<string>();
+let renderedDialogChatId: string | null = null;
+let draftSyncTimer: ReturnType<typeof setTimeout> | null = null;
 
 const workspaceListEl = document.getElementById("workspace-list")!;
 const chatListEl = document.getElementById("chat-list")!;
+const newProjectChatBtn = document.getElementById("new-project-chat-btn") as HTMLButtonElement;
 const explorerHeadingEl = document.getElementById("explorer-heading")!;
 const fileTreeEl = document.getElementById("file-tree")!;
 const activeChatTitleEl = document.getElementById("active-chat-title")!;
@@ -56,10 +72,14 @@ const linkErrorBannerEl = document.getElementById("link-error-banner")!;
 const linkErrorCodeEl = document.getElementById("link-error-code")!;
 const linkErrorMessageEl = document.getElementById("link-error-message")!;
 const dismissErrorBtn = document.getElementById("dismiss-error-btn")!;
+const onboardingSlotEl = document.getElementById("onboarding-slot")!;
 const chatTranscriptEl = document.getElementById("chat-transcript")!;
+const chatDialogsEl = document.getElementById("chat-dialogs")!;
 const standaloneAttachmentsEl = document.getElementById("standalone-attachments")!;
 const composerForm = document.getElementById("composer-form") as HTMLFormElement;
 const composerInput = document.getElementById("composer-input") as HTMLTextAreaElement;
+const composerAbortBtn = document.getElementById("composer-abort-btn") as HTMLButtonElement;
+const composerSendBtn = document.getElementById("composer-send-btn") as HTMLButtonElement;
 const tabStripEl = document.getElementById("tab-strip")!;
 const breadcrumbsBarEl = document.getElementById("breadcrumbs-bar")!;
 const breadcrumbsNavEl = document.getElementById("breadcrumbs-nav")!;
@@ -129,6 +149,11 @@ async function syncActiveIsolatedViewBounds(): Promise<void> {
 
 function renderWorkspaces(): void {
   workspaceListEl.innerHTML = "";
+  if (activeWorkspaceId && workspaces.some((w) => w.workspaceId === activeWorkspaceId)) {
+    newProjectChatBtn.classList.remove("hidden");
+  } else {
+    newProjectChatBtn.classList.add("hidden");
+  }
   for (const ws of workspaces) {
     const btn = document.createElement("button");
     btn.type = "button";
@@ -146,6 +171,7 @@ function renderWorkspaces(): void {
     btn.addEventListener("click", async () => {
       // Switching the visible sidebar project NEVER mutates the active chat's recorded workspace!
       activeWorkspaceId = ws.workspaceId;
+      void api.syncUiState({ activeWorkspaceId });
       renderWorkspaces();
       await renderFileTree();
     });
@@ -163,16 +189,28 @@ function renderChatList(): void {
 
     const label = document.createElement("span");
     label.textContent = chat.title;
+
+    const pendingCount = pendingDialogsByChatId.get(chat.chatId)?.length ?? 0;
     const meta = document.createElement("span");
-    meta.className = "nav-item-meta";
+    meta.className = pendingCount > 0 ? "nav-item-meta pending-pill" : "nav-item-meta";
     meta.textContent =
-      chat.owningBinding.kind === "project" ? chat.owningBinding.workspaceDisplayName : "standalone";
+      pendingCount > 0
+        ? `approval (${pendingCount})`
+        : chat.owningBinding.kind === "project"
+          ? chat.owningBinding.workspaceDisplayName
+          : "standalone";
     btn.append(label, meta);
 
     btn.addEventListener("click", () => {
       const current = getActiveChat();
       if (current) {
         current.composerDraft = composerInput.value;
+        void api.syncUiState({
+          activeChatId: chat.chatId,
+          draftUpdate: { chatId: current.chatId, draft: current.composerDraft },
+        });
+      } else {
+        void api.syncUiState({ activeChatId: chat.chatId });
       }
       activeChatId = chat.chatId;
       clearError();
@@ -250,6 +288,142 @@ async function renderFileTree(): Promise<void> {
   await renderDir("", 0);
 }
 
+function renderOnboardingSlot(): void {
+  onboardingSlotEl.innerHTML = "";
+  if (!unconfiguredModelChatIds.has(activeChatId)) {
+    return;
+  }
+  const card = buildNoConfiguredModelCard(() => {
+    unconfiguredModelChatIds.delete(activeChatId);
+    renderOnboardingSlot();
+  });
+  onboardingSlotEl.append(card);
+}
+
+function syncComposerStreamingControls(): void {
+  const isTurnActive = turnActiveChats.has(activeChatId);
+  if (isTurnActive) {
+    composerAbortBtn.classList.remove("hidden");
+    composerSendBtn.disabled = true;
+  } else {
+    composerAbortBtn.classList.add("hidden");
+    composerSendBtn.disabled = false;
+  }
+}
+
+function syncStreamingCardInTranscript(): void {
+  const existingCard = chatTranscriptEl.querySelector<HTMLElement>(
+    '[data-testid="streaming-message-card"]',
+  );
+  const isTurnActive = turnActiveChats.has(activeChatId);
+  const partialText = streamingTextByChatId.get(activeChatId);
+
+  if (!isTurnActive && partialText === undefined) {
+    existingCard?.remove();
+    return;
+  }
+
+  let card = existingCard;
+  let textEl: HTMLElement | null = card?.querySelector(".streaming-text") ?? null;
+  if (!card || !textEl) {
+    card = document.createElement("article");
+    card.className = "message-card role-assistant streaming-card";
+    card.dataset.testid = "streaming-message-card";
+
+    const roleEl = document.createElement("div");
+    roleEl.className = "message-role";
+    roleEl.textContent = "assistant · streaming";
+
+    textEl = document.createElement("p");
+    textEl.className = "message-text streaming-text";
+    textEl.dataset.testid = "streaming-message-text";
+
+    card.append(roleEl, textEl);
+    chatTranscriptEl.append(card);
+  }
+
+  textEl.textContent =
+    partialText && partialText.length > 0 ? partialText : "Waiting for OMP response...";
+  chatTranscriptEl.scrollTop = chatTranscriptEl.scrollHeight;
+}
+
+function renderChatDialogs(): void {
+  const pendingDialogs = pendingDialogsByChatId.get(activeChatId) ?? [];
+  const pendingOpenUrl = pendingOpenUrlByChatId.get(activeChatId);
+
+  if (renderedDialogChatId !== activeChatId) {
+    chatDialogsEl.innerHTML = "";
+    renderedDialogChatId = activeChatId;
+  }
+
+  // Reconcile open_url card
+  const existingOpenUrlEl = chatDialogsEl.querySelector<HTMLElement>(
+    '[data-open-url-card="true"]',
+  );
+  if (!pendingOpenUrl) {
+    existingOpenUrlEl?.remove();
+  } else if (!existingOpenUrlEl || existingOpenUrlEl.dataset.targetUrl !== pendingOpenUrl.url) {
+    existingOpenUrlEl?.remove();
+    const urlCard = buildOpenUrlCard(
+      pendingOpenUrl,
+      async (url) => {
+        await openBrowserTab(url);
+      },
+      () => {
+        pendingOpenUrlByChatId.delete(activeChatId);
+        renderChatDialogs();
+      },
+    );
+    urlCard.dataset.openUrlCard = "true";
+    urlCard.dataset.targetUrl = pendingOpenUrl.url;
+    chatDialogsEl.prepend(urlCard);
+  }
+
+  // Reconcile dialog request cards by id so in-progress user typing/focus is never lost
+  const activeIds = new Set(pendingDialogs.map((d) => d.id));
+  for (const child of Array.from(chatDialogsEl.querySelectorAll<HTMLElement>("[data-dialog-id]"))) {
+    if (!activeIds.has(child.dataset.dialogId ?? "")) {
+      child.remove();
+    }
+  }
+
+  const chatIdSnapshot = activeChatId;
+  for (const req of pendingDialogs) {
+    const alreadyMounted = Array.from(chatDialogsEl.children).some(
+      (el) => (el as HTMLElement).dataset.dialogId === req.id,
+    );
+    if (alreadyMounted) {
+      continue;
+    }
+    const card = buildOmpDialogCard(req, async (response) => {
+      const res = await api.respondToDialog(chatIdSnapshot, response);
+      const remaining = (pendingDialogsByChatId.get(chatIdSnapshot) ?? []).filter(
+        (item) => item.id !== req.id,
+      );
+      if (remaining.length > 0) {
+        pendingDialogsByChatId.set(chatIdSnapshot, remaining);
+      } else {
+        pendingDialogsByChatId.delete(chatIdSnapshot);
+      }
+      renderChatList();
+      if (activeChatId === chatIdSnapshot) {
+        renderChatDialogs();
+      }
+      if (!res.ok && res.error) {
+        showError("OMP_DIALOG", res.error);
+      }
+    });
+    card.dataset.dialogId = req.id;
+    chatDialogsEl.append(card);
+  }
+
+  if (pendingDialogs.length === 0 && !pendingOpenUrl) {
+    chatDialogsEl.classList.add("hidden");
+  } else {
+    chatDialogsEl.classList.remove("hidden");
+  }
+}
+
 function renderActiveChat(): void {
   const chat = getActiveChat();
   if (!chat) return;
@@ -277,6 +451,9 @@ function renderActiveChat(): void {
   }
 
   composerInput.value = chat.composerDraft;
+  renderOnboardingSlot();
+  syncComposerStreamingControls();
+  renderChatDialogs();
 
   chatTranscriptEl.innerHTML = "";
   for (const msg of chat.messages) {
@@ -344,6 +521,8 @@ function renderActiveChat(): void {
 
     chatTranscriptEl.append(card);
   }
+
+  syncStreamingCardInTranscript();
 }
 
 async function handleChatLinkClick(
@@ -886,18 +1065,22 @@ async function closeTab(tabKey: string): Promise<void> {
 dismissErrorBtn.addEventListener("click", () => clearError());
 
 openFolderBtn.addEventListener("click", async () => {
+  const current = getActiveChat();
+  if (current) {
+    current.composerDraft = composerInput.value;
+    await api.syncUiState({
+      draftUpdate: { chatId: current.chatId, draft: current.composerDraft },
+    });
+  }
   const opened = await api.openFolderDialog();
   if (!opened) return;
   const { workspace: ws, chat } = opened;
   if (!workspaces.some((w) => w.workspaceId === ws.workspaceId)) {
     workspaces.push(ws);
   }
-  if (!chats.some((c) => c.chatId === chat.chatId)) {
+  const existingIdx = chats.findIndex((c) => c.chatId === chat.chatId);
+  if (existingIdx === -1) {
     chats.push(chat);
-  }
-  const current = getActiveChat();
-  if (current) {
-    current.composerDraft = composerInput.value;
   }
   activeWorkspaceId = ws.workspaceId;
   activeChatId = chat.chatId;
@@ -908,6 +1091,24 @@ openFolderBtn.addEventListener("click", async () => {
   await renderFileTree();
 });
 
+newProjectChatBtn.addEventListener("click", async () => {
+  if (!activeWorkspaceId) return;
+  const current = getActiveChat();
+  if (current) {
+    current.composerDraft = composerInput.value;
+    await api.syncUiState({
+      draftUpdate: { chatId: current.chatId, draft: current.composerDraft },
+    });
+  }
+  const created = await api.createProjectChat(activeWorkspaceId);
+  if (!created) return;
+  chats.push(created);
+  activeChatId = created.chatId;
+  clearError();
+  renderChatList();
+  renderActiveChat();
+});
+
 newBrowserTabBtn.addEventListener("click", async () => {
   await openBrowserTab("https://example.com");
 });
@@ -916,6 +1117,9 @@ attachStandaloneBtn.addEventListener("click", async () => {
   const chat = getActiveChat();
   if (!chat || chat.owningBinding.kind !== "standalone") return;
   chat.composerDraft = composerInput.value;
+  await api.syncUiState({
+    draftUpdate: { chatId: chat.chatId, draft: chat.composerDraft },
+  });
   const attachedPath = await api.attachStandaloneFileDialog(chat.chatId);
   if (!attachedPath) return;
   if (!chat.owningBinding.attachedCanonicalPaths.includes(attachedPath)) {
@@ -926,8 +1130,59 @@ attachStandaloneBtn.addEventListener("click", async () => {
 
 composerInput.addEventListener("input", () => {
   const chat = getActiveChat();
+  if (!chat) return;
+  const draftValue = composerInput.value;
+  chat.composerDraft = draftValue;
+  const targetChatId = chat.chatId;
+  if (draftSyncTimer) {
+    clearTimeout(draftSyncTimer);
+  }
+  draftSyncTimer = setTimeout(() => {
+    draftSyncTimer = null;
+    void api.syncUiState({
+      draftUpdate: { chatId: targetChatId, draft: draftValue },
+    });
+  }, 180);
+});
+
+function flushPendingDraftSync(): void {
+  if (!draftSyncTimer) {
+    return;
+  }
+  clearTimeout(draftSyncTimer);
+  draftSyncTimer = null;
+  const chat = getActiveChat();
   if (chat) {
     chat.composerDraft = composerInput.value;
+    void api.syncUiState({
+      draftUpdate: { chatId: chat.chatId, draft: chat.composerDraft },
+    });
+  }
+}
+
+composerInput.addEventListener("blur", () => {
+  flushPendingDraftSync();
+});
+
+window.addEventListener("beforeunload", () => {
+  flushPendingDraftSync();
+});
+
+composerInput.addEventListener("keydown", (ev) => {
+  if ((ev.ctrlKey || ev.metaKey) && ev.key === "Enter") {
+    ev.preventDefault();
+    composerForm.requestSubmit();
+  }
+});
+
+composerAbortBtn.addEventListener("click", async () => {
+  const targetChatId = activeChatId;
+  if (!targetChatId) return;
+  composerAbortBtn.disabled = true;
+  try {
+    await api.abortTurn(targetChatId);
+  } finally {
+    composerAbortBtn.disabled = false;
   }
 });
 
@@ -935,19 +1190,42 @@ composerForm.addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const chat = getActiveChat();
   const text = composerInput.value.trim();
-  if (!chat || !text) return;
+  if (!chat || !text || turnActiveChats.has(chat.chatId)) return;
+
+  if (draftSyncTimer) {
+    clearTimeout(draftSyncTimer);
+    draftSyncTimer = null;
+  }
   composerInput.value = "";
   chat.composerDraft = "";
   chat.messages.push({
-    messageId: `user-${Date.now()}`,
+    messageId: `user-${Date.now()}-${chat.messages.length}`,
     role: "user",
     text,
     isRestoredMessage: false,
   });
+
+  turnActiveChats.add(chat.chatId);
+  streamingTextByChatId.set(chat.chatId, "");
+  clearError();
   renderActiveChat();
-  const res = await api.sendPrompt(chat.chatId, text);
-  if (!res.ok && res.error) {
-    showError("OMP_RUNTIME", res.error);
+
+  const submittedChatId = chat.chatId;
+  const res = await api.sendPrompt(submittedChatId, text);
+  if (!res.ok) {
+    turnActiveChats.delete(submittedChatId);
+    streamingTextByChatId.delete(submittedChatId);
+    if (activeChatId === submittedChatId) {
+      syncStreamingCardInTranscript();
+      syncComposerStreamingControls();
+      if (
+        res.error &&
+        !unconfiguredModelChatIds.has(submittedChatId) &&
+        linkErrorBannerEl.classList.contains("hidden")
+      ) {
+        showError("OMP_RUNTIME", res.error);
+      }
+    }
   }
 });
 
@@ -959,55 +1237,56 @@ window.addEventListener("resize", () => {
   void syncActiveIsolatedViewBounds();
 });
 
-function extractAssistantText(rawMessage: unknown): { role: "assistant" | "system"; text: string } | null {
-  if (!rawMessage || typeof rawMessage !== "object") {
-    return null;
-  }
-  const msg = rawMessage as Record<string, unknown>;
-  const role = msg.role;
-  if (role === "user") {
-    return null;
-  }
-  const normalizedRole: "assistant" | "system" = role === "system" ? "system" : "assistant";
-
-  if (typeof msg.text === "string" && msg.text.trim().length > 0) {
-    return { role: normalizedRole, text: msg.text };
-  }
-  if (typeof msg.content === "string" && msg.content.trim().length > 0) {
-    return { role: normalizedRole, text: msg.content };
-  }
-  if (Array.isArray(msg.content)) {
-    const parts: string[] = [];
-    for (const block of msg.content) {
-      if (block && typeof block === "object") {
-        const record = block as Record<string, unknown>;
-        if (record.type === "text" && typeof record.text === "string") {
-          parts.push(record.text);
-        }
-      }
-    }
-    const joined = parts.join("\n").trim();
-    if (joined.length > 0) {
-      return { role: normalizedRole, text: joined };
-    }
-  }
-  return null;
-}
-
 const runtimeBadgeEl = document.getElementById("runtime-badge");
 
-function handleIncomingOmpEvent(payload: { chatId: string; event: import("../shared/contracts").OmpAdapterEvent }): void {
+function handleIncomingOmpEvent(payload: {
+  chatId: string;
+  event: import("../shared/contracts").OmpAdapterEvent;
+}): void {
   const { chatId, event } = payload;
   const targetChat = chats.find((c) => c.chatId === chatId);
 
   if (event.type === "ready") {
+    unconfiguredModelChatIds.delete(chatId);
     if (runtimeBadgeEl) {
       runtimeBadgeEl.textContent = `OMP v${event.metadata.ompVersion} · RPC v2 · always-ask`;
+    }
+    if (chatId === activeChatId) {
+      renderOnboardingSlot();
+    }
+    return;
+  }
+
+  if (event.type === "state") {
+    if (event.state.isStreaming) {
+      turnActiveChats.add(chatId);
+    } else if (event.state.isSettled) {
+      turnActiveChats.delete(chatId);
+      streamingTextByChatId.delete(chatId);
+    }
+    if (chatId === activeChatId) {
+      syncStreamingCardInTranscript();
+      syncComposerStreamingControls();
+    }
+    return;
+  }
+
+  if (event.type === "message_update") {
+    turnActiveChats.add(chatId);
+    const prev = streamingTextByChatId.get(chatId) ?? "";
+    const next = extractStreamingUpdateText(event.payload, prev);
+    if (next !== null) {
+      streamingTextByChatId.set(chatId, next);
+    }
+    if (chatId === activeChatId) {
+      syncStreamingCardInTranscript();
+      syncComposerStreamingControls();
     }
     return;
   }
 
   if (event.type === "message_end" && targetChat) {
+    streamingTextByChatId.delete(chatId);
     const extracted = extractAssistantText(event.message);
     if (extracted) {
       const messageId = `omp-${Date.now()}-${targetChat.messages.length}`;
@@ -1019,22 +1298,140 @@ function handleIncomingOmpEvent(payload: { chatId: string; event: import("../sha
         links: parsedLinks.length > 0 ? parsedLinks : undefined,
         isRestoredMessage: false,
       });
+    }
+    if (chatId === activeChatId) {
+      renderActiveChat();
+    }
+    return;
+  }
+
+  if (event.type === "prompt_result") {
+    const partial = streamingTextByChatId.get(chatId);
+    streamingTextByChatId.delete(chatId);
+    turnActiveChats.delete(chatId);
+
+    if (event.status === "aborted" && targetChat) {
+      const trimmedPartial = partial?.trim() ?? "";
+      if (trimmedPartial.length > 0) {
+        const messageId = `omp-aborted-${Date.now()}-${targetChat.messages.length}`;
+        const combined = `${trimmedPartial}\n\n[Turn aborted]`;
+        const parsedLinks = parseReplyLinks(trimmedPartial, messageId);
+        targetChat.messages.push({
+          messageId,
+          role: "assistant",
+          text: combined,
+          links: parsedLinks.length > 0 ? parsedLinks : undefined,
+          isRestoredMessage: false,
+        });
+      } else {
+        targetChat.messages.push({
+          messageId: `sys-aborted-${Date.now()}-${targetChat.messages.length}`,
+          role: "system",
+          text: "Turn aborted.",
+          isRestoredMessage: false,
+        });
+      }
       if (chatId === activeChatId) {
         renderActiveChat();
+      }
+      return;
+    }
+
+    if (chatId === activeChatId) {
+      syncStreamingCardInTranscript();
+      syncComposerStreamingControls();
+      if (event.status === "error" && event.error) {
+        showError("OMP_PROMPT_ERROR", event.error);
       }
     }
     return;
   }
 
-  if (event.type === "prompt_result" && event.status === "error" && event.error) {
+  if (event.type === "session_settled") {
+    streamingTextByChatId.delete(chatId);
+    turnActiveChats.delete(chatId);
     if (chatId === activeChatId) {
-      showError("OMP_PROMPT_ERROR", event.error);
+      syncStreamingCardInTranscript();
+      syncComposerStreamingControls();
+    }
+    return;
+  }
+
+  if (event.type === "dialog_request") {
+    const list = pendingDialogsByChatId.get(chatId) ?? [];
+    const filtered = list.filter((d) => d.id !== event.request.id);
+    filtered.push(event.request);
+    pendingDialogsByChatId.set(chatId, filtered);
+    renderChatList();
+    if (chatId === activeChatId) {
+      renderChatDialogs();
+    }
+    return;
+  }
+
+  if (event.type === "dialog_cancel") {
+    const list = pendingDialogsByChatId.get(chatId);
+    if (list) {
+      const remaining = list.filter((d) => d.id !== event.targetId);
+      if (remaining.length > 0) {
+        pendingDialogsByChatId.set(chatId, remaining);
+      } else {
+        pendingDialogsByChatId.delete(chatId);
+      }
+      renderChatList();
+      if (chatId === activeChatId) {
+        renderChatDialogs();
+      }
+    }
+    return;
+  }
+
+  if (event.type === "open_url") {
+    const targetUrl = event.launchUrl ?? event.url;
+    if (/^https?:\/\//i.test(targetUrl)) {
+      pendingOpenUrlByChatId.set(chatId, {
+        url: targetUrl,
+        displayUrl: event.url,
+        instructions: event.instructions,
+      });
+      if (chatId === activeChatId) {
+        renderChatDialogs();
+      }
+    } else if (chatId === activeChatId) {
+      showError("BLOCKED_URL_SCHEME", "OMP requested an unsupported non-HTTP URL scheme.");
+    }
+    return;
+  }
+
+  if (event.type === "notify") {
+    if (event.level === "error" && chatId === activeChatId) {
+      showError("OMP_NOTIFY", event.message);
     }
     return;
   }
 
   if (event.type === "transport_error") {
+    if (!event.recoverable) {
+      streamingTextByChatId.delete(chatId);
+      turnActiveChats.delete(chatId);
+      pendingDialogsByChatId.delete(chatId);
+      renderChatList();
+    }
+    if (event.code === "NO_CONFIGURED_MODEL") {
+      unconfiguredModelChatIds.add(chatId);
+      if (chatId === activeChatId) {
+        clearError();
+        renderOnboardingSlot();
+        syncStreamingCardInTranscript();
+        syncComposerStreamingControls();
+        renderChatDialogs();
+      }
+      return;
+    }
     if (chatId === activeChatId) {
+      syncStreamingCardInTranscript();
+      syncComposerStreamingControls();
+      renderChatDialogs();
       showError(event.code, event.message);
     }
   }
@@ -1050,6 +1447,12 @@ async function boot(): Promise<void> {
   activeWorkspaceId = bootstrap.activeWorkspaceId;
   chats = bootstrap.chats;
   activeChatId = bootstrap.activeChatId;
+
+  if (bootstrap.diagnostics.ompStatus === "no-configured-model") {
+    unconfiguredModelChatIds.add(activeChatId);
+  } else if (bootstrap.diagnostics.ompVersion && runtimeBadgeEl) {
+    runtimeBadgeEl.textContent = `OMP v${bootstrap.diagnostics.ompVersion} · RPC v2 · always-ask`;
+  }
 
   renderWorkspaces();
   renderChatList();

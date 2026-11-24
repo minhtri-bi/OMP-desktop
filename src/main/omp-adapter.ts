@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
 import type {
   OmpAdapterEvent,
   OmpDialogRequest,
@@ -8,6 +9,7 @@ import type {
   OmpReadyMetadata,
   OmpSessionSnapshot,
 } from "../shared/contracts";
+import { Win32JobObject } from "./win32-job";
 
 interface ChunkAccumulator {
   chunkId: string;
@@ -182,6 +184,7 @@ interface PendingRequest {
 
 export class OmpRuntimeAdapter {
   private child: ChildProcessWithoutNullStreams | null = null;
+  private jobObject: Win32JobObject | null = null;
   private config: OmpProcessConfig | null = null;
   private readyMetadata: OmpReadyMetadata | null = null;
   private readonly reassembler = new RpcV2FrameReassembler();
@@ -192,6 +195,7 @@ export class OmpRuntimeAdapter {
   private stderrText = "";
   private requestCounter = 0;
   private promptRequestCount = 0;
+  private isStreamingTurn = false;
   private readyResolve: ((meta: OmpReadyMetadata) => void) | null = null;
   private readyReject: ((err: Error) => void) | null = null;
   private disposed = false;
@@ -202,6 +206,14 @@ export class OmpRuntimeAdapter {
 
   getRetainedMessages(): readonly unknown[] {
     return this.retainedMessages;
+  }
+
+  isRunning(): boolean {
+    return this.child !== null && this.child.exitCode === null && !this.disposed;
+  }
+
+  isAssignedToJobObject(): boolean {
+    return this.jobObject?.isAssigned() ?? false;
   }
 
   onEvent(listener: (event: OmpAdapterEvent) => void): () => void {
@@ -223,6 +235,7 @@ export class OmpRuntimeAdapter {
     }
     this.config = config;
     this.disposed = false;
+    this.isStreamingTurn = false;
     this.stderrText = "";
     this.stdoutBuffer = "";
 
@@ -231,7 +244,9 @@ export class OmpRuntimeAdapter {
         ? config.scope.canonicalWorkspaceRoot
         : config.scope.standaloneCwd;
     if (config.scope.kind === "standalone") {
-      fs.mkdirSync(cwd, { recursive: true });
+      // Place an empty .git sentinel inside standalone-cwd so OMP's ancestor AGENTS.md / repo-root
+      // discovery halts at standalone-cwd and never walks up into %USERPROFILE%.
+      fs.mkdirSync(path.join(cwd, ".git"), { recursive: true });
     }
 
     const args = [
@@ -242,6 +257,7 @@ export class OmpRuntimeAdapter {
       config.approvalMode,
     ];
     if (config.sessionDir) {
+      fs.mkdirSync(config.sessionDir, { recursive: true });
       args.push("--session-dir", config.sessionDir);
     } else {
       args.push("--no-session");
@@ -265,6 +281,13 @@ export class OmpRuntimeAdapter {
     });
     this.child = child;
 
+    if (process.platform === "win32" && typeof child.pid === "number") {
+      const job = new Win32JobObject();
+      if (job.assignProcess(child.pid)) {
+        this.jobObject = job;
+      }
+    }
+
     const readyPromise = new Promise<OmpReadyMetadata>((resolve, reject) => {
       this.readyResolve = resolve;
       this.readyReject = reject;
@@ -287,6 +310,7 @@ export class OmpRuntimeAdapter {
 
     child.on("exit", (code, signal) => {
       this.child = null;
+      this.isStreamingTurn = false;
       const isUnconfigured = /No default model selected/i.test(this.stderrText);
       if (!this.readyMetadata && isUnconfigured) {
         const err = new Error(
@@ -327,6 +351,14 @@ export class OmpRuntimeAdapter {
             `OMP RPC protocol v2 negotiation failed: ${String(negResp.error ?? "unknown")}`,
           );
         }
+      }
+
+      if (config.supportsAskDialog === true) {
+        this.writeRawFrame({
+          id: "omp-ask-init",
+          type: "set_ask_dialog",
+          enabled: true,
+        });
       }
 
       this.readyMetadata = {
@@ -467,7 +499,15 @@ export class OmpRuntimeAdapter {
       return;
     }
 
+    if (type === "state" && frame.state && typeof frame.state === "object") {
+      const state = frame.state as OmpSessionSnapshot;
+      this.isStreamingTurn = Boolean(state.isStreaming);
+      this.emit({ type: "state", state });
+      return;
+    }
+
     if (type === "message_update") {
+      this.isStreamingTurn = true;
       this.emit({ type: "message_update", payload: frame });
       return;
     }
@@ -479,6 +519,7 @@ export class OmpRuntimeAdapter {
     }
 
     if (type === "prompt_result") {
+      this.isStreamingTurn = false;
       this.emit({
         type: "prompt_result",
         id: typeof frame.id === "string" ? frame.id : undefined,
@@ -494,6 +535,7 @@ export class OmpRuntimeAdapter {
     }
 
     if (type === "session_settled") {
+      this.isStreamingTurn = false;
       this.emit({ type: "session_settled" });
       return;
     }
@@ -700,15 +742,22 @@ export class OmpRuntimeAdapter {
     streamingBehavior?: "steer" | "followUp",
   ): Promise<{ id: string }> {
     this.promptRequestCount += 1;
-    const resp = await this.sendCommand({
-      type: "prompt",
-      message,
-      ...(streamingBehavior ? { streamingBehavior } : {}),
-    });
-    if (resp.success !== true) {
-      throw new Error(`prompt failed: ${String(resp.error ?? "unknown")}`);
+    this.isStreamingTurn = true;
+    try {
+      const resp = await this.sendCommand({
+        type: "prompt",
+        message,
+        ...(streamingBehavior ? { streamingBehavior } : {}),
+      });
+      if (resp.success !== true) {
+        this.isStreamingTurn = false;
+        throw new Error(`prompt failed: ${String(resp.error ?? "unknown")}`);
+      }
+      return { id: String(resp.id ?? "") };
+    } catch (err) {
+      this.isStreamingTurn = false;
+      throw err;
     }
-    return { id: String(resp.id ?? "") };
   }
 
   async abort(): Promise<void> {
@@ -756,7 +805,11 @@ export class OmpRuntimeAdapter {
   async dispose(): Promise<void> {
     this.disposed = true;
     const child = this.child;
+    const job = this.jobObject;
+    this.jobObject = null;
+
     if (!child) {
+      job?.terminateAndClose(0);
       return;
     }
 
@@ -770,19 +823,27 @@ export class OmpRuntimeAdapter {
     });
 
     try {
+      if (this.isStreamingTurn && child.exitCode === null && child.stdin.writable) {
+        child.stdin.write(`${JSON.stringify({ id: "omp-shutdown-abort", type: "abort" })}\n`, "utf8");
+      }
       child.stdin.end();
     } catch {
       // ignore already-closed stdin
     }
 
     let timer: NodeJS.Timeout | undefined;
+    let timedOut = false;
     await Promise.race([
       exitPromise,
       new Promise<void>((resolve) => {
         timer = setTimeout(() => {
+          timedOut = true;
           if (child.exitCode === null) {
-            if (process.platform === "win32" && child.pid) {
-              spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true });
+            if (process.platform === "win32") {
+              job?.terminateAndClose(1);
+              if (child.exitCode === null && child.pid) {
+                spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true });
+              }
             } else {
               child.kill("SIGKILL");
             }
@@ -795,6 +856,17 @@ export class OmpRuntimeAdapter {
     if (timer) {
       clearTimeout(timer);
     }
+
+    if (timedOut && child.exitCode === null) {
+      await Promise.race([
+        exitPromise,
+        new Promise<void>((resolve) => setTimeout(resolve, 500)),
+      ]);
+    }
+
+    // Sweep any lingering grandchild tool processes inside the Job Object and close the kernel handle.
+    job?.terminateAndClose(0);
     this.child = null;
+    this.isStreamingTurn = false;
   }
 }

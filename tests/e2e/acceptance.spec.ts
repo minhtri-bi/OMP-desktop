@@ -446,3 +446,240 @@ rl.on("close", () => process.exit(0));
     fs.rmSync(stubDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 150 });
   }
 });
+
+test("Stage 2: NO_CONFIGURED_MODEL onboarding, streaming deltas, approval/secret/ask dialogs, abort, and restart persistence", async () => {
+  const stage2Dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-desktop-e2e-stage2-"));
+  const unconfUserData = path.join(stage2Dir, "userdata-unconf");
+  const persistUserData = path.join(stage2Dir, "userdata-persist");
+  fs.mkdirSync(unconfUserData, { recursive: true });
+  fs.mkdirSync(persistUserData, { recursive: true });
+
+  const unconfMockOmp = path.join(stage2Dir, "mock-omp-unconf.cjs");
+  fs.writeFileSync(
+    unconfMockOmp,
+    `process.stderr.write("No default model selected. Run omp /login\\n"); process.exit(1);\n`,
+    "utf8",
+  );
+
+  const interactiveMockOmp = path.join(stage2Dir, "mock-omp-interactive.cjs");
+  fs.writeFileSync(
+    interactiveMockOmp,
+    `
+const readline = require("node:readline");
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+
+send({
+  type: "ready",
+  version: "19.1.1",
+  protocolVersion: 1,
+  supportedProtocolVersions: [1, 2],
+  maxFrameBytes: 1048576,
+  maxReassembledFrameBytes: 67108864,
+  supportsBashExcludeFromContext: true,
+});
+
+let confirmResult = null;
+let secretLen = 0;
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.type === "negotiate_protocol") {
+    send({ id: msg.id, type: "response", command: "negotiate_protocol", success: true, data: { protocolVersion: 2 } });
+  } else if (msg.type === "set_ask_dialog") {
+    send({ id: msg.id, type: "response", command: "set_ask_dialog", success: true });
+  } else if (msg.type === "prompt" && msg.message === "test-approvals-and-stream") {
+    send({ id: msg.id, type: "response", command: "prompt", success: true, data: { agentInvoked: true } });
+    send({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "Checking " } });
+    send({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "permissions..." } });
+    send({
+      type: "extension_ui_request",
+      id: "confirm-1",
+      method: "confirm",
+      title: "Approve write tool",
+      message: "Write settings to config.json",
+    });
+  } else if (msg.type === "extension_ui_response" && msg.id === "confirm-1") {
+    confirmResult = msg.confirmed;
+    send({
+      type: "extension_ui_request",
+      id: "secret-1",
+      method: "input",
+      title: "Enter API secret",
+      placeholder: "sk-...",
+      secret: true,
+    });
+  } else if (msg.type === "extension_ui_response" && msg.id === "secret-1") {
+    secretLen = typeof msg.value === "string" ? msg.value.length : -1;
+    send({
+      type: "extension_ui_request",
+      id: "ask-1",
+      method: "ask",
+      questions: [
+        {
+          id: "q-env",
+          header: "Environment",
+          question: "Which target should OMP verify?",
+          options: [
+            { label: "Staging", description: "Safe pre-prod check" },
+            { label: "Production", description: "Live check" },
+          ],
+          recommended: 0,
+        },
+      ],
+    });
+  } else if (msg.type === "extension_ui_response" && msg.id === "ask-1") {
+    const ans = Array.isArray(msg.answers) ? msg.answers[0] : null;
+    const summary =
+      "Completed turn: confirmed=" +
+      String(confirmResult) +
+      ", secretLen=" +
+      String(secretLen) +
+      ", askChoice=" +
+      (ans && ans.selectedOptions ? ans.selectedOptions.join("+") : "none") +
+      ", askCustom=" +
+      (ans && ans.customInput ? ans.customInput : "none");
+    send({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: summary }] },
+    });
+    send({ type: "prompt_result", agentInvoked: true, status: "completed", sessionSettled: true });
+  } else if (msg.type === "prompt" && msg.message === "test-abort-stream") {
+    send({ id: msg.id, type: "response", command: "prompt", success: true, data: { agentInvoked: true } });
+    send({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", delta: "Streaming step before abort" },
+    });
+  } else if (msg.type === "abort") {
+    send({ id: msg.id, type: "response", command: "abort", success: true });
+    send({ type: "prompt_result", agentInvoked: true, status: "aborted", sessionSettled: true });
+  }
+});
+rl.on("close", () => process.exit(0));
+`,
+    "utf8",
+  );
+
+  const launchArgs = [path.resolve(process.cwd())];
+  if (process.platform === "linux") {
+    launchArgs.push("--no-sandbox", "--disable-gpu-sandbox");
+  }
+
+  try {
+    // 1. Verify NO_CONFIGURED_MODEL onboarding card when OMP has zero configured models
+    const appUnconf = await electron.launch({
+      args: launchArgs,
+      env: {
+        ...process.env,
+        OMP_DESKTOP_FIXTURE_ROOT: fixtureCopyRoot,
+        OMP_DESKTOP_USER_DATA: unconfUserData,
+        OMP_DESKTOP_OMP_PATH: process.execPath,
+        OMP_DESKTOP_OMP_ARGS_PREFIX: JSON.stringify([unconfMockOmp]),
+      },
+    });
+    try {
+      const winUnconf = await appUnconf.firstWindow();
+      await winUnconf.waitForLoadState("domcontentloaded");
+      await winUnconf.getByTestId("composer-input").fill("hello unconfigured omp");
+      await winUnconf.getByTestId("composer-send-btn").click();
+
+      await expect(winUnconf.getByTestId("onboarding-card")).toBeVisible();
+      await expect(winUnconf.getByTestId("onboarding-card")).toContainText("NO_CONFIGURED_MODEL");
+      await expect(winUnconf.getByTestId("onboarding-card")).toContainText("/login");
+    } finally {
+      await appUnconf.close();
+    }
+
+    // 2. Verify live streaming, confirm/secret/ask dialogs, abort button, and draft/chat persistence
+    const appLive = await electron.launch({
+      args: launchArgs,
+      env: {
+        ...process.env,
+        OMP_DESKTOP_FIXTURE_ROOT: fixtureCopyRoot,
+        OMP_DESKTOP_USER_DATA: persistUserData,
+        OMP_DESKTOP_OMP_PATH: process.execPath,
+        OMP_DESKTOP_OMP_ARGS_PREFIX: JSON.stringify([interactiveMockOmp]),
+      },
+    });
+    try {
+      const winLive = await appLive.firstWindow();
+      await winLive.waitForLoadState("domcontentloaded");
+
+      await winLive.getByTestId("composer-input").fill("test-approvals-and-stream");
+      await winLive.getByTestId("composer-send-btn").click();
+
+      // Streaming card & Abort button appear while confirm approval card waits for user decision
+      await expect(winLive.getByTestId("streaming-message-text")).toHaveText("Checking permissions...");
+      await expect(winLive.getByTestId("composer-abort-btn")).toBeVisible();
+      await expect(winLive.getByTestId("dialog-card-confirm-1")).toBeVisible();
+      await expect(winLive.getByTestId("dialog-confirm-message")).toHaveText(
+        "Write settings to config.json",
+      );
+      await winLive.getByTestId("dialog-approve-btn").click();
+
+      // Secret input dialog masks input (`type="password"`) and never echoes secret to transcript
+      await expect(winLive.getByTestId("dialog-card-secret-1")).toBeVisible();
+      const secretInput = winLive.getByTestId("dialog-secret-input");
+      await expect(secretInput).toHaveAttribute("type", "password");
+      await secretInput.fill("s3cr3t-tok");
+      await winLive.getByTestId("dialog-submit-btn").click();
+
+      // Structured ask dialog renders recommended choice and custom write-in
+      await expect(winLive.getByTestId("dialog-card-ask-1")).toBeVisible();
+      await winLive.getByTestId("dialog-ask-custom-q-env").fill("smoke-check");
+      await winLive.getByTestId("dialog-submit-btn").click();
+
+      await expect(winLive.getByTestId("chat-transcript")).toContainText(
+        "Completed turn: confirmed=true, secretLen=10, askChoice=Staging, askCustom=smoke-check",
+      );
+      await expect(winLive.getByTestId("chat-transcript")).not.toContainText("s3cr3t-tok");
+      await expect(winLive.getByTestId("composer-abort-btn")).toBeHidden();
+
+      // Test mid-stream Abort button
+      await winLive.getByTestId("composer-input").fill("test-abort-stream");
+      await winLive.getByTestId("composer-send-btn").click();
+      await expect(winLive.getByTestId("streaming-message-text")).toHaveText(
+        "Streaming step before abort",
+      );
+      await winLive.getByTestId("composer-abort-btn").click();
+
+      await expect(winLive.getByTestId("chat-transcript")).toContainText("Streaming step before abort");
+      await expect(winLive.getByTestId("chat-transcript")).toContainText("[Turn aborted]");
+      await expect(winLive.getByTestId("composer-abort-btn")).toBeHidden();
+
+      // Type unsent draft and wait for debounced state sync before closing app
+      await winLive.getByTestId("composer-input").fill("persisted-draft-across-restart");
+      await winLive.waitForTimeout(300);
+    } finally {
+      await appLive.close();
+    }
+
+    // 3. Relaunch Electron with the SAME userData directory and confirm transcripts + draft persisted
+    const appRestarted = await electron.launch({
+      args: launchArgs,
+      env: {
+        ...process.env,
+        OMP_DESKTOP_FIXTURE_ROOT: fixtureCopyRoot,
+        OMP_DESKTOP_USER_DATA: persistUserData,
+        OMP_DESKTOP_OMP_PATH: process.execPath,
+        OMP_DESKTOP_OMP_ARGS_PREFIX: JSON.stringify([interactiveMockOmp]),
+      },
+    });
+    try {
+      const winRestarted = await appRestarted.firstWindow();
+      await winRestarted.waitForLoadState("domcontentloaded");
+
+      await expect(winRestarted.getByTestId("chat-transcript")).toContainText(
+        "Completed turn: confirmed=true, secretLen=10, askChoice=Staging, askCustom=smoke-check",
+      );
+      await expect(winRestarted.getByTestId("chat-transcript")).toContainText("[Turn aborted]");
+      await expect(winRestarted.getByTestId("composer-input")).toHaveValue(
+        "persisted-draft-across-restart",
+      );
+    } finally {
+      await appRestarted.close();
+    }
+  } finally {
+    fs.rmSync(stage2Dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 150 });
+  }
+});

@@ -285,4 +285,125 @@ rl.on("close", () => {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
+
+  it("creates standalone .git sentinel, enables ask dialogs, bridges dialog responses, and terminates Win32 Job Object grandchildren", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "omp-adapter-job-"));
+    try {
+      const logFile = path.join(tmp, "job-frames.jsonl");
+      const grandchildPidFile = path.join(tmp, "grandchild.pid");
+      const standaloneDir = path.join(tmp, "standalone-cwd");
+
+      const grandchildScript = writeMockOmpScript(
+        tmp,
+        "hung-grandchild",
+        `setInterval(() => {}, 10000);`,
+      );
+
+      const script = writeMockOmpScript(
+        tmp,
+        "fake-omp-hung-with-grandchild",
+        `
+const fs = require("node:fs");
+const { spawn } = require("node:child_process");
+const readline = require("node:readline");
+
+const child = spawn(process.execPath, [${JSON.stringify(grandchildScript)}], {
+  stdio: "ignore",
+  windowsHide: true,
+});
+fs.writeFileSync(${JSON.stringify(grandchildPidFile)}, String(child.pid), "utf8");
+
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+send({
+  type: "ready",
+  protocolVersion: 1,
+  supportedProtocolVersions: [1, 2],
+  maxFrameBytes: 1048576,
+  maxReassembledFrameBytes: 67108864,
+  supportsBashExcludeFromContext: true,
+});
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  fs.appendFileSync(${JSON.stringify(logFile)}, line + "\\n");
+  const msg = JSON.parse(line);
+  if (msg.type === "negotiate_protocol") {
+    send({ id: msg.id, type: "response", command: "negotiate_protocol", success: true, data: { protocolVersion: 2 } });
+  }
+});
+// Intentionally ignore stdin close so dispose() exercises timeout + Job Object / SIGKILL cleanup
+setInterval(() => {}, 10000);
+        `,
+      );
+
+      const adapter = new OmpRuntimeAdapter();
+      await adapter.start({
+        ompExecutablePath: process.execPath,
+        ompArgsPrefix: [script],
+        scope: { kind: "standalone", standaloneCwd: standaloneDir },
+        approvalMode: "always-ask",
+        supportsAskDialog: true,
+        requireProtocolV2: true,
+        shutdownTimeoutMs: 250,
+      });
+
+      // Standalone CWD ancestor sentinel must exist
+      expect(fs.existsSync(path.join(standaloneDir, ".git"))).toBe(true);
+
+      if (process.platform === "win32") {
+        expect(adapter.isAssignedToJobObject()).toBe(true);
+      }
+
+      await adapter.respondToDialog({ id: "dlg-confirm", kind: "confirm", confirmed: true });
+      await adapter.respondToDialog({ id: "dlg-val", kind: "value", value: "opt-a" });
+      await adapter.respondToDialog({
+        id: "dlg-ask",
+        kind: "ask",
+        answers: [{ id: "q1", selectedOptions: ["Yes"], customInput: "note" }],
+      });
+
+      await new Promise((r) => setTimeout(r, 80));
+      const grandchildPid = Number.parseInt(fs.readFileSync(grandchildPidFile, "utf8").trim(), 10);
+      expect(grandchildPid).toBeGreaterThan(0);
+
+      await adapter.dispose();
+
+      if (process.platform === "win32") {
+        // Wait briefly for kernel Job Object termination propagation and verify grandchild is dead
+        await new Promise((r) => setTimeout(r, 150));
+        let alive = false;
+        try {
+          process.kill(grandchildPid, 0);
+          alive = true;
+        } catch {
+          alive = false;
+        }
+        expect(alive).toBe(false);
+      } else {
+        // Clean up POSIX grandchild spawned by test helper
+        try {
+          process.kill(grandchildPid, "SIGKILL");
+        } catch {
+          // already exited
+        }
+      }
+
+      const frames = fs
+        .readFileSync(logFile, "utf8")
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l) as Record<string, unknown>);
+      expect(frames.some((f) => f.type === "set_ask_dialog" && f.enabled === true)).toBe(true);
+      expect(
+        frames.some(
+          (f) => f.type === "extension_ui_response" && f.id === "dlg-confirm" && f.confirmed === true,
+        ),
+      ).toBe(true);
+      expect(
+        frames.some((f) => f.type === "extension_ui_response" && f.id === "dlg-ask"),
+      ).toBe(true);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
+  });
 });

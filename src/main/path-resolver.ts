@@ -493,6 +493,16 @@ export function authorizeCanonicalReadPath(
     return real;
   }
 
+  if (
+    owningBinding.workspaceRoot.startsWith("\\\\") ||
+    owningBinding.workspaceRoot.startsWith("//")
+  ) {
+    throw new Error("Access denied: unsafe workspace root.");
+  }
+  const rootLs = fs.lstatSync(owningBinding.workspaceRoot);
+  if (rootLs.isSymbolicLink() || !rootLs.isDirectory()) {
+    throw new Error("Access denied: workspace root is unavailable or was replaced with a symlink.");
+  }
   const canonicalRoot = canonicalizeExistingPath(owningBinding.workspaceRoot);
   const walked = safeWalkWithinCanonicalRoot(canonicalRoot, candidatePath);
   if (!walked.ok) {
@@ -615,10 +625,23 @@ export function resolveMessageFileLink(request: MessageFileLinkRequest): PathRes
 
   // Project workspace binding
   const { workspaceRoot, workspaceDisplayName } = request.owningBinding;
-  if (!fs.existsSync(workspaceRoot)) {
+  if (workspaceRoot.startsWith("\\\\") || workspaceRoot.startsWith("//")) {
+    return fail("UNSAFE_PATH_SYNTAX", "UNC or device workspace root is blocked.", displayTarget);
+  }
+  let rootLs: fs.Stats;
+  try {
+    rootLs = fs.lstatSync(workspaceRoot);
+  } catch {
     return fail(
       "WORKSPACE_UNAVAILABLE",
       `Owning workspace "${workspaceDisplayName}" is no longer available on disk.`,
+      displayTarget,
+    );
+  }
+  if (rootLs.isSymbolicLink() || !rootLs.isDirectory()) {
+    return fail(
+      "OUT_OF_WORKSPACE",
+      `Owning workspace "${workspaceDisplayName}" was replaced with a symlink or non-directory.`,
       displayTarget,
     );
   }
@@ -634,7 +657,8 @@ export function resolveMessageFileLink(request: MessageFileLinkRequest): PathRes
     );
   }
 
-  const platformRelative = cleaned.replace(/\\/g, path.sep);
+  const platformRelative =
+    process.platform === "win32" ? cleaned.replace(/\\/g, path.sep) : cleaned;
   const candidatePath = isAbsolutePathCrossPlatform(cleaned)
     ? cleaned
     : path.resolve(canonicalRoot, platformRelative);
