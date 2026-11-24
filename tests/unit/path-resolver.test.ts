@@ -3,8 +3,10 @@ import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
+  authorizeCanonicalReadPath,
   buildPreviewTabKey,
   canonicalizeExistingPath,
+  isPathWithinRoot,
   resolveMessageFileLink,
   resolvePreviewSubresource,
   validatePathSyntax,
@@ -163,12 +165,11 @@ describe("path-resolver (Windows-first canonicalization & isolation)", () => {
   });
 
   it("produces identical case-insensitive tab keys across Windows path variants", () => {
-    const canonical = canonicalizeExistingPath(path.join(wsA, "src", "hello.ts"));
-    const keyLower = buildPreviewTabKey(bindingA, canonical);
-    const keyUpper = buildPreviewTabKey(bindingA, canonical.toUpperCase());
-    const keyBackslash = buildPreviewTabKey(bindingA, canonical.replace(/\//g, "\\"));
-    expect(keyLower).toBe(keyUpper);
-    expect(keyLower).toBe(keyBackslash);
+    const winForward = buildPreviewTabKey(bindingA, "C:/Work/workspace-a/src/hello.ts");
+    const winBackslash = buildPreviewTabKey(bindingA, "c:\\work\\WORKSPACE-A\\SRC\\HELLO.TS");
+    const winExtended = buildPreviewTabKey(bindingA, "\\\\?\\C:\\Work\\workspace-a\\src\\hello.ts");
+    expect(winForward).toBe(winBackslash);
+    expect(winForward).toBe(winExtended);
   });
 
   it("distinguishes STALE_LINK (restored) from MISSING_FILE (live)", () => {
@@ -272,5 +273,153 @@ describe("path-resolver (Windows-first canonicalization & isolation)", () => {
     const siblingBlocked = resolvePreviewSubresource(path.dirname(singleFile), "/other.js", singleFile);
     expect(siblingBlocked.ok).toBe(false);
     if (!siblingBlocked.ok) expect(siblingBlocked.statusCode).toBe(403);
+  });
+
+  it("enforces strict case-sensitive canonical containment so differing-case sibling directories cannot bypass isolation", () => {
+    expect(isPathWithinRoot("/tmp/Workspace-A/secret.txt", "/tmp/workspace-a")).toBe(false);
+    expect(isPathWithinRoot("C:\\Work\\App\\secret.txt", "C:\\Work\\app")).toBe(false);
+    expect(isPathWithinRoot("c:\\work\\app\\file.txt", "C:\\work\\app")).toBe(true);
+
+    if (process.platform !== "win32") {
+      const upperSibling = path.join(tempDir, "Workspace-A");
+      fs.mkdirSync(upperSibling, { recursive: true });
+      fs.writeFileSync(path.join(upperSibling, "case-secret.txt"), "CASE_SECRET");
+      const caseLink = path.join(wsA, "case-escape.txt");
+      fs.symlinkSync(path.join(upperSibling, "case-secret.txt"), caseLink, "file");
+
+      const linkRes = resolveMessageFileLink({
+        chatId: "chat-1",
+        messageId: "msg-case",
+        isRestoredMessage: false,
+        owningBinding: bindingA,
+        rawTarget: "case-escape.txt",
+      });
+      expect(linkRes.ok).toBe(false);
+      if (!linkRes.ok) expect(linkRes.code).toBe("OUT_OF_WORKSPACE");
+
+      const subRes = resolvePreviewSubresource(canonicalizeExistingPath(wsA), "/case-escape.txt");
+      expect(subRes.ok).toBe(false);
+      if (!subRes.ok) expect(subRes.statusCode).toBe(403);
+    }
+  });
+
+  it("rejects workspace symlinks targeting UNC shares via lstat/readlink without contacting the share", () => {
+    const uncLinkName = "unc-share-link.txt";
+    const uncLinkPath = path.join(wsA, uncLinkName);
+    let created = false;
+    try {
+      fs.symlinkSync("\\\\192.0.2.1\\share\\secret.txt", uncLinkPath, "file");
+      created = true;
+    } catch {
+      // Unprivileged Windows environments without SeCreateSymbolicLinkPrivilege cannot create file symlinks;
+      // direct UNC syntax rejection is still covered above.
+    }
+
+    if (created) {
+      const linkRes = resolveMessageFileLink({
+        chatId: "chat-1",
+        messageId: "msg-unc-sym",
+        isRestoredMessage: false,
+        owningBinding: bindingA,
+        rawTarget: uncLinkName,
+      });
+      expect(linkRes.ok).toBe(false);
+      if (!linkRes.ok) expect(linkRes.code).toBe("UNSAFE_PATH_SYNTAX");
+
+      const subRes = resolvePreviewSubresource(canonicalizeExistingPath(wsA), `/${uncLinkName}`);
+      expect(subRes.ok).toBe(false);
+      if (!subRes.ok) expect(subRes.statusCode).toBe(403);
+    }
+  });
+
+  it("allows reading files inside POSIX folders whose names contain colons without reparsing root as Windows link syntax", () => {
+    if (process.platform === "win32") return;
+    const colonDir = path.join(tempDir, "release:2026");
+    fs.mkdirSync(colonDir, { recursive: true });
+    const readmePath = path.join(colonDir, "README.md");
+    fs.writeFileSync(readmePath, "# Release 2026\n", "utf8");
+
+    const colonBinding: Extract<ChatWorkspaceBinding, { kind: "project" }> = {
+      kind: "project",
+      workspaceId: "ws-colon",
+      workspaceRoot: canonicalizeExistingPath(colonDir),
+      workspaceDisplayName: "release:2026",
+    };
+
+    const resolved = resolveMessageFileLink({
+      chatId: "chat-colon",
+      messageId: "m1",
+      isRestoredMessage: false,
+      owningBinding: colonBinding,
+      rawTarget: "README.md",
+    });
+    expect(resolved.ok).toBe(true);
+    if (resolved.ok) {
+      const authorized = authorizeCanonicalReadPath(resolved.descriptor.canonicalPath, colonBinding);
+      expect(authorized).toBe(canonicalizeExistingPath(readmePath));
+    }
+
+    // End-to-end POSIX symlink into a workspace subfolder with a colon -> encoded preview URL -> subresource served
+    const subColonDir = path.join(wsA, "release:2026");
+    fs.mkdirSync(subColonDir, { recursive: true });
+    const htmlInColon = path.join(subColonDir, "index.html");
+    fs.writeFileSync(htmlInColon, "<h1>Release 2026 Preview</h1>", "utf8");
+    const symHtml = path.join(wsA, "colon-preview.html");
+    fs.symlinkSync(path.join("release:2026", "index.html"), symHtml, "file");
+
+    const symResolved = resolveMessageFileLink({
+      chatId: "chat-1",
+      messageId: "m-colon-sym",
+      isRestoredMessage: false,
+      owningBinding: bindingA,
+      rawTarget: "colon-preview.html",
+    });
+    expect(symResolved.ok).toBe(true);
+    if (symResolved.ok) {
+      expect(symResolved.descriptor.viewerKind).toBe("html-isolated-browser");
+      const relUrl =
+        "/" +
+        path
+          .relative(canonicalizeExistingPath(wsA), symResolved.descriptor.canonicalPath)
+          .split(path.sep)
+          .map((seg) => encodeURIComponent(seg))
+          .join("/");
+      expect(relUrl).toBe("/release%3A2026/index.html");
+      const served = resolvePreviewSubresource(canonicalizeExistingPath(wsA), relUrl);
+      expect(served.ok).toBe(true);
+      if (served.ok) {
+        expect(served.canonicalPath).toBe(canonicalizeExistingPath(htmlInColon));
+      }
+    }
+  });
+
+  it("does not treat literal backslashes on POSIX as path separators and rejects root symlink swaps", () => {
+    if (process.platform === "win32") return;
+    expect(isPathWithinRoot("/tmp/workspace-a\\evil/secret.txt", "/tmp/workspace-a")).toBe(false);
+
+    const backslashSibling = path.join(tempDir, "workspace-a\\evil");
+    fs.mkdirSync(backslashSibling, { recursive: true });
+    const siblingSecret = path.join(backslashSibling, "secret.txt");
+    fs.writeFileSync(siblingSecret, "BACKSLASH_SIBLING_SECRET", "utf8");
+
+    const symName = "backslash-escape.txt";
+    fs.symlinkSync(siblingSecret, path.join(wsA, symName), "file");
+
+    const subRes = resolvePreviewSubresource(canonicalizeExistingPath(wsA), `/${symName}`);
+    expect(subRes.ok).toBe(false);
+    if (!subRes.ok) expect(subRes.statusCode).toBe(403);
+
+    // Swap a workspace root itself to a symlink pointing outside and confirm preview subresource rejects it
+    const swappable = path.join(tempDir, "ws-swappable");
+    fs.mkdirSync(swappable, { recursive: true });
+    fs.writeFileSync(path.join(swappable, "index.html"), "<h1>ok</h1>", "utf8");
+    const registeredRoot = canonicalizeExistingPath(swappable);
+
+    fs.rmSync(swappable, { recursive: true, force: true });
+    fs.symlinkSync(outsideDir, swappable, "dir");
+
+    const afterSwap = resolvePreviewSubresource(registeredRoot, "/secret.txt");
+    expect(afterSwap.ok).toBe(false);
+    if (!afterSwap.ok) expect(afterSwap.statusCode).toBe(403);
   });
 });

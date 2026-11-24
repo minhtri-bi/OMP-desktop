@@ -315,23 +315,30 @@ export class OmpRuntimeAdapter {
       }
     });
 
-    const initialMeta = await readyPromise;
-    if (config.requireProtocolV2) {
-      const negResp = await this.sendCommand({
-        type: "negotiate_protocol",
-        protocolVersion: 2,
-      });
-      if (negResp.success !== true) {
-        throw new Error(`OMP RPC protocol v2 negotiation failed: ${String(negResp.error ?? "unknown")}`);
+    try {
+      const initialMeta = await readyPromise;
+      if (config.requireProtocolV2) {
+        const negResp = await this.sendCommand({
+          type: "negotiate_protocol",
+          protocolVersion: 2,
+        });
+        if (negResp.success !== true) {
+          throw new Error(
+            `OMP RPC protocol v2 negotiation failed: ${String(negResp.error ?? "unknown")}`,
+          );
+        }
       }
-    }
 
-    this.readyMetadata = {
-      ...initialMeta,
-      negotiatedProtocolVersion: 2,
-    };
-    this.emit({ type: "ready", metadata: this.readyMetadata });
-    return this.readyMetadata;
+      this.readyMetadata = {
+        ...initialMeta,
+        negotiatedProtocolVersion: 2,
+      };
+      this.emit({ type: "ready", metadata: this.readyMetadata });
+      return this.readyMetadata;
+    } catch (err) {
+      await this.dispose();
+      throw err;
+    }
   }
 
   private failStartupOrPending(
@@ -541,19 +548,24 @@ export class OmpRuntimeAdapter {
       return;
     }
 
-    // Security invariant: never inject raw form HTML into the desktop shell; if no listener handles form, auto-cancel cleanly.
+    // Security invariant: never inject raw form HTML into the desktop shell; always cancel unless a safe declarative form renderer is explicitly enabled.
     if (method === "form") {
+      if (this.config?.supportsFormDialog !== true) {
+        void this.respondToDialog({ id, kind: "cancel" });
+        this.emit({
+          type: "notify",
+          message: "Cancelled unsupported OMP HTML form dialog to prevent turn stall.",
+          level: "warning",
+        });
+        return;
+      }
       const request: OmpDialogRequest = {
         id,
         method: "form",
         rawHtmlForm: typeof frame.html === "string" ? frame.html : "",
         timeoutMs: typeof frame.timeout === "number" ? frame.timeout : undefined,
       };
-      if (this.listeners.size === 0) {
-        void this.respondToDialog({ id, kind: "cancel" });
-      } else {
-        this.emit({ type: "dialog_request", request });
-      }
+      this.emit({ type: "dialog_request", request });
       return;
     }
 

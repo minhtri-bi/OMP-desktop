@@ -9,6 +9,7 @@ import type {
   SourceFileContent,
   WorkspaceDescriptor,
 } from "../shared/contracts";
+import { parseReplyLinks } from "../shared/link-parser";
 import { PdfPreviewController } from "./pdf-viewer";
 
 declare global {
@@ -296,15 +297,42 @@ function renderActiveChat(): void {
       const chipList = document.createElement("div");
       chipList.className = "chip-list";
       for (const link of msg.links) {
+        const isExternalUrl = link.kind === "external-url" || /^https?:\/\//i.test(link.rawTarget);
         const chip = document.createElement("button");
         chip.type = "button";
-        chip.className = "file-chip";
+        chip.className = isExternalUrl ? "file-chip external-url-chip" : "file-chip";
         chip.dataset.testid = `chat-link-${link.id}`;
-        // Untrusted-link protection: expose true target in tooltip so deceptive labels cannot disguise path
-        chip.title = link.anchor
-          ? `${link.rawTarget}#L${link.anchor.startLine}${link.anchor.endLine ? `-L${link.anchor.endLine}` : ""}`
-          : link.rawTarget;
-        chip.textContent = link.label;
+        chip.dataset.linkKind = isExternalUrl ? "external-url" : "file";
+
+        if (isExternalUrl) {
+          let hostLabel = link.rawTarget;
+          try {
+            hostLabel = new URL(link.rawTarget).host || link.rawTarget;
+          } catch {
+            // keep rawTarget fallback
+          }
+          // Untrusted-link protection: external web links MUST be visually distinguished from local file chips
+          chip.title = `External URL (${hostLabel}): ${link.rawTarget}`;
+
+          const badgeEl = document.createElement("span");
+          badgeEl.className = "chip-badge";
+          badgeEl.textContent = "WEB";
+
+          const labelEl = document.createElement("span");
+          labelEl.textContent = link.label;
+
+          const hostEl = document.createElement("span");
+          hostEl.className = "chip-host";
+          hostEl.textContent = hostLabel;
+
+          chip.append(badgeEl, labelEl, hostEl);
+        } else {
+          // Untrusted-link protection: expose true target in tooltip so deceptive labels cannot disguise path
+          chip.title = link.anchor
+            ? `${link.rawTarget}#L${link.anchor.startLine}${link.anchor.endLine ? `-L${link.anchor.endLine}` : ""}`
+            : link.rawTarget;
+          chip.textContent = link.label;
+        }
 
         chip.addEventListener("click", async () => {
           await handleChatLinkClick(chat, msg.messageId, msg.isRestoredMessage, link);
@@ -516,7 +544,10 @@ async function toggleBreadcrumbSiblings(
 ): Promise<void> {
   if (!breadcrumbSiblingsEl.classList.contains("hidden")) {
     hideSiblingPopover();
-    await syncActiveIsolatedViewBounds();
+    const active = getActiveTab();
+    if (active && (active.kind === "html-isolated-browser" || active.kind === "browser")) {
+      await activateTab(activeTabKey);
+    }
     return;
   }
 
@@ -789,13 +820,26 @@ async function activateTab(tabKey: string | null): Promise<void> {
     await api.hideIsolatedViews();
     sourceViewerEl.classList.add("hidden");
     isolatedViewHostEl.classList.add("hidden");
-    pdfViewerEl.classList.remove("hidden");
+    pdfViewerEl.classList.add("hidden");
+    await pdfController.destroy();
     if (tab.pdfBytes) {
-      const state = await pdfController.loadBytes(tab.pdfBytes.slice());
-      tab.pdfPage = state.currentPage;
-      tab.pdfTotalPages = state.totalPages;
-      tab.pdfZoom = state.zoom;
-      renderToolbar(tab);
+      try {
+        const state = await pdfController.loadBytes(tab.pdfBytes.slice());
+        tab.pdfPage = state.currentPage;
+        tab.pdfTotalPages = state.totalPages;
+        tab.pdfZoom = state.zoom;
+        pdfViewerEl.classList.remove("hidden");
+        renderToolbar(tab);
+      } catch (err) {
+        await pdfController.destroy();
+        tab.pdfPage = 0;
+        tab.pdfTotalPages = 0;
+        renderToolbar(tab);
+        showError(
+          "PDF_LOAD_ERROR",
+          `Could not render PDF "${tab.title}": ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     }
     return;
   }
@@ -842,13 +886,25 @@ async function closeTab(tabKey: string): Promise<void> {
 dismissErrorBtn.addEventListener("click", () => clearError());
 
 openFolderBtn.addEventListener("click", async () => {
-  const ws = await api.openFolderDialog();
-  if (!ws) return;
+  const opened = await api.openFolderDialog();
+  if (!opened) return;
+  const { workspace: ws, chat } = opened;
   if (!workspaces.some((w) => w.workspaceId === ws.workspaceId)) {
     workspaces.push(ws);
   }
+  if (!chats.some((c) => c.chatId === chat.chatId)) {
+    chats.push(chat);
+  }
+  const current = getActiveChat();
+  if (current) {
+    current.composerDraft = composerInput.value;
+  }
   activeWorkspaceId = ws.workspaceId;
+  activeChatId = chat.chatId;
+  clearError();
   renderWorkspaces();
+  renderChatList();
+  renderActiveChat();
   await renderFileTree();
 });
 
@@ -859,12 +915,20 @@ newBrowserTabBtn.addEventListener("click", async () => {
 attachStandaloneBtn.addEventListener("click", async () => {
   const chat = getActiveChat();
   if (!chat || chat.owningBinding.kind !== "standalone") return;
+  chat.composerDraft = composerInput.value;
   const attachedPath = await api.attachStandaloneFileDialog(chat.chatId);
   if (!attachedPath) return;
   if (!chat.owningBinding.attachedCanonicalPaths.includes(attachedPath)) {
     chat.owningBinding.attachedCanonicalPaths.push(attachedPath);
   }
   renderActiveChat();
+});
+
+composerInput.addEventListener("input", () => {
+  const chat = getActiveChat();
+  if (chat) {
+    chat.composerDraft = composerInput.value;
+  }
 });
 
 composerForm.addEventListener("submit", async (ev) => {
@@ -895,7 +959,92 @@ window.addEventListener("resize", () => {
   void syncActiveIsolatedViewBounds();
 });
 
+function extractAssistantText(rawMessage: unknown): { role: "assistant" | "system"; text: string } | null {
+  if (!rawMessage || typeof rawMessage !== "object") {
+    return null;
+  }
+  const msg = rawMessage as Record<string, unknown>;
+  const role = msg.role;
+  if (role === "user") {
+    return null;
+  }
+  const normalizedRole: "assistant" | "system" = role === "system" ? "system" : "assistant";
+
+  if (typeof msg.text === "string" && msg.text.trim().length > 0) {
+    return { role: normalizedRole, text: msg.text };
+  }
+  if (typeof msg.content === "string" && msg.content.trim().length > 0) {
+    return { role: normalizedRole, text: msg.content };
+  }
+  if (Array.isArray(msg.content)) {
+    const parts: string[] = [];
+    for (const block of msg.content) {
+      if (block && typeof block === "object") {
+        const record = block as Record<string, unknown>;
+        if (record.type === "text" && typeof record.text === "string") {
+          parts.push(record.text);
+        }
+      }
+    }
+    const joined = parts.join("\n").trim();
+    if (joined.length > 0) {
+      return { role: normalizedRole, text: joined };
+    }
+  }
+  return null;
+}
+
+const runtimeBadgeEl = document.getElementById("runtime-badge");
+
+function handleIncomingOmpEvent(payload: { chatId: string; event: import("../shared/contracts").OmpAdapterEvent }): void {
+  const { chatId, event } = payload;
+  const targetChat = chats.find((c) => c.chatId === chatId);
+
+  if (event.type === "ready") {
+    if (runtimeBadgeEl) {
+      runtimeBadgeEl.textContent = `OMP v${event.metadata.ompVersion} · RPC v2 · always-ask`;
+    }
+    return;
+  }
+
+  if (event.type === "message_end" && targetChat) {
+    const extracted = extractAssistantText(event.message);
+    if (extracted) {
+      const messageId = `omp-${Date.now()}-${targetChat.messages.length}`;
+      const parsedLinks = parseReplyLinks(extracted.text, messageId);
+      targetChat.messages.push({
+        messageId,
+        role: extracted.role,
+        text: extracted.text,
+        links: parsedLinks.length > 0 ? parsedLinks : undefined,
+        isRestoredMessage: false,
+      });
+      if (chatId === activeChatId) {
+        renderActiveChat();
+      }
+    }
+    return;
+  }
+
+  if (event.type === "prompt_result" && event.status === "error" && event.error) {
+    if (chatId === activeChatId) {
+      showError("OMP_PROMPT_ERROR", event.error);
+    }
+    return;
+  }
+
+  if (event.type === "transport_error") {
+    if (chatId === activeChatId) {
+      showError(event.code, event.message);
+    }
+  }
+}
+
 async function boot(): Promise<void> {
+  api.onOmpEvent((payload) => {
+    handleIncomingOmpEvent(payload);
+  });
+
   const bootstrap = await api.getBootstrap();
   workspaces = bootstrap.workspaces;
   activeWorkspaceId = bootstrap.activeWorkspaceId;

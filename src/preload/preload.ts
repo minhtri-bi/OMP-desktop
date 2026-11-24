@@ -10,6 +10,8 @@ import type {
 const bridge: DesktopBridgeApi = {
   getBootstrap: () => ipcRenderer.invoke("omp-desktop:get-bootstrap"),
   openFolderDialog: () => ipcRenderer.invoke("omp-desktop:open-folder-dialog"),
+  createProjectChat: (workspaceId: string) =>
+    ipcRenderer.invoke("omp-desktop:create-project-chat", workspaceId),
   listDirectory: (workspaceRoot: string, relativeDir: string) =>
     ipcRenderer.invoke("omp-desktop:list-directory", workspaceRoot, relativeDir),
   resolveAndOpenLink: (request: MessageFileLinkRequest) =>
