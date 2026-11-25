@@ -406,4 +406,479 @@ setInterval(() => {}, 10000);
       fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
+
+  it("propagates explicit local command completion (agentInvoked: false) while keeping omitted-data prompts active", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "omp-adapter-local-cmd-"));
+    try {
+      const logFile = path.join(tmp, "frames.jsonl");
+      const script = writeMockOmpScript(
+        tmp,
+        "fake-omp-local-cmd",
+        `
+const fs = require("node:fs");
+const readline = require("node:readline");
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+
+send({
+  type: "ready",
+  protocolVersion: 1,
+  supportedProtocolVersions: [1, 2],
+  maxFrameBytes: 1048576,
+  maxReassembledFrameBytes: 67108864,
+  supportsBashExcludeFromContext: true,
+});
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  fs.appendFileSync(${JSON.stringify(logFile)}, line + "\\n");
+  const msg = JSON.parse(line);
+  if (msg.type === "negotiate_protocol") {
+    send({ id: msg.id, type: "response", command: "negotiate_protocol", success: true, data: { protocolVersion: 2 } });
+  } else if (msg.type === "prompt" && msg.message === "/session info") {
+    // Local command ack: explicit agentInvoked: false and NO prompt_result
+    send({ id: msg.id, type: "response", command: "prompt", success: true, data: { agentInvoked: false } });
+  } else if (msg.type === "prompt" && msg.message === "regular-omitted-data") {
+    // Regular prompt ack in OMP v19.1.1 omits data entirely and emits prompt_result later
+    send({ id: msg.id, type: "response", command: "prompt", success: true });
+    send({ type: "prompt_result", id: msg.id, agentInvoked: true, status: "completed", sessionSettled: true });
+  } else if (msg.type === "prompt" && msg.message === "/retry") {
+    send({ id: msg.id, type: "response", command: "prompt", success: true, data: { agentInvoked: true } });
+    send({ type: "prompt_result", id: msg.id, agentInvoked: true, status: "completed", sessionSettled: true });
+  }
+});
+rl.on("close", () => process.exit(0));
+        `,
+      );
+
+      const adapter = new OmpRuntimeAdapter();
+      await adapter.start({
+        ompExecutablePath: process.execPath,
+        ompArgsPrefix: [script],
+        scope: { kind: "standalone", standaloneCwd: path.join(tmp, "standalone") },
+        approvalMode: "always-ask",
+        requireProtocolV2: true,
+        shutdownTimeoutMs: 2_000,
+      });
+
+      const localRes = await adapter.sendPrompt("/session info");
+      expect(localRes.agentInvoked).toBe(false);
+
+      const regularRes = await adapter.sendPrompt("regular-omitted-data");
+      expect(regularRes.agentInvoked).toBe(true);
+
+      const builtinAgentRes = await adapter.sendPrompt("/retry");
+      expect(builtinAgentRes.agentInvoked).toBe(true);
+
+      // Re-run local command right before dispose() to prove isStreamingTurn was cleared (no spurious abort on shutdown)
+      const localRes2 = await adapter.sendPrompt("/session info");
+      expect(localRes2.agentInvoked).toBe(false);
+
+      await adapter.dispose();
+
+      const frames = fs
+        .readFileSync(logFile, "utf8")
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l) as Record<string, unknown>);
+      expect(frames.some((f) => f.type === "abort")).toBe(false);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("resumes saved runtime history via --session-dir + --continue across restarts", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "omp-adapter-resume-"));
+    try {
+      const sessionDir = path.join(tmp, "chat-session");
+      const script = writeMockOmpScript(
+        tmp,
+        "fake-omp-session-resume",
+        `
+const fs = require("node:fs");
+const path = require("node:path");
+const readline = require("node:readline");
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+
+const argv = process.argv.slice(2);
+const dirIdx = argv.indexOf("--session-dir");
+const sessionDir = dirIdx !== -1 ? argv[dirIdx + 1] : null;
+const hasContinue = argv.includes("--continue");
+const sessionFile = sessionDir ? path.join(sessionDir, "latest.json") : null;
+
+// Mirror OMP v19.1.1: --session-dir alone starts fresh; only --continue loads saved history
+let history = [];
+if (sessionFile && hasContinue && fs.existsSync(sessionFile)) {
+  history = JSON.parse(fs.readFileSync(sessionFile, "utf8"));
+}
+
+send({
+  type: "ready",
+  protocolVersion: 1,
+  supportedProtocolVersions: [1, 2],
+  maxFrameBytes: 1048576,
+  maxReassembledFrameBytes: 67108864,
+  supportsBashExcludeFromContext: true,
+});
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.type === "negotiate_protocol") {
+    send({ id: msg.id, type: "response", command: "negotiate_protocol", success: true, data: { protocolVersion: 2 } });
+  } else if (msg.type === "get_state") {
+    send({
+      id: msg.id,
+      type: "response",
+      command: "get_state",
+      success: true,
+      data: {
+        sessionId: "sess-resumable",
+        sessionFile: sessionFile || undefined,
+        isStreaming: false,
+        isCompacting: false,
+        isSettled: true,
+        messageCount: history.length,
+        queuedMessageCount: 0,
+        hasPendingAsyncWork: false,
+      },
+    });
+  } else if (msg.type === "get_messages_page") {
+    send({
+      id: msg.id,
+      type: "response",
+      command: "get_messages_page",
+      success: true,
+      data: {
+        messages: history,
+        totalMessages: history.length,
+      },
+    });
+  } else if (msg.type === "prompt") {
+    history.push({ role: "user", text: msg.message });
+    history.push({ role: "assistant", text: "Recorded: " + msg.message });
+    if (sessionFile) {
+      fs.writeFileSync(sessionFile, JSON.stringify(history), "utf8");
+    }
+    send({ id: msg.id, type: "response", command: "prompt", success: true });
+    send({ type: "message_end", message: { role: "assistant", text: "Recorded: " + msg.message } });
+    send({ type: "prompt_result", id: msg.id, agentInvoked: true, status: "completed", sessionSettled: true });
+  }
+});
+rl.on("close", () => process.exit(0));
+        `,
+      );
+
+      // Run 1: write a turn into sessionDir
+      const adapter1 = new OmpRuntimeAdapter();
+      await adapter1.start({
+        ompExecutablePath: process.execPath,
+        ompArgsPrefix: [script],
+        scope: { kind: "standalone", standaloneCwd: path.join(tmp, "standalone") },
+        approvalMode: "always-ask",
+        sessionDir,
+        requireProtocolV2: true,
+        shutdownTimeoutMs: 2_000,
+      });
+      await adapter1.sendPrompt("Project codename is Falcon");
+      await adapter1.dispose();
+
+      // Run 2: restart against the same sessionDir -> runtime history must already be loaded
+      const adapter2 = new OmpRuntimeAdapter();
+      await adapter2.start({
+        ompExecutablePath: process.execPath,
+        ompArgsPrefix: [script],
+        scope: { kind: "standalone", standaloneCwd: path.join(tmp, "standalone") },
+        approvalMode: "always-ask",
+        sessionDir,
+        requireProtocolV2: true,
+        shutdownTimeoutMs: 2_000,
+      });
+      const state = await adapter2.getState();
+      expect(state.messageCount).toBe(2);
+      const page = await adapter2.getMessagesPage();
+      expect(page.totalMessages).toBe(2);
+      expect(JSON.stringify(page.messages)).toContain("Project codename is Falcon");
+      await adapter2.dispose();
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("unblocks negotiate_protocol when an extension emits a session_start dialog before handshake completes", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "omp-adapter-startup-dlg-"));
+    try {
+      const script = writeMockOmpScript(
+        tmp,
+        "fake-omp-startup-dialog",
+        `
+const readline = require("node:readline");
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+
+// Emit ready before running extension session_start dialog (exact OMP v19.1.1 behavior)
+send({
+  type: "ready",
+  protocolVersion: 1,
+  supportedProtocolVersions: [1, 2],
+  maxFrameBytes: 1048576,
+  maxReassembledFrameBytes: 67108864,
+  supportsBashExcludeFromContext: true,
+});
+send({
+  type: "extension_ui_request",
+  id: "startup-confirm-1",
+  method: "confirm",
+  title: "Trust workspace extension?",
+  message: "Allow session_start hook to initialize",
+});
+
+let startupApproved = false;
+let queuedNegotiate = null;
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.type === "extension_ui_response" && msg.id === "startup-confirm-1") {
+    startupApproved = msg.confirmed === true;
+    if (queuedNegotiate) {
+      send({
+        id: queuedNegotiate.id,
+        type: "response",
+        command: "negotiate_protocol",
+        success: startupApproved,
+        data: { protocolVersion: 2 },
+      });
+      queuedNegotiate = null;
+    }
+  } else if (msg.type === "negotiate_protocol") {
+    if (startupApproved) {
+      send({ id: msg.id, type: "response", command: "negotiate_protocol", success: true, data: { protocolVersion: 2 } });
+    } else {
+      queuedNegotiate = msg;
+    }
+  }
+});
+rl.on("close", () => process.exit(0));
+        `,
+      );
+
+      const adapter = new OmpRuntimeAdapter();
+      let startupDialogHandled = false;
+      adapter.onEvent((ev) => {
+        if (ev.type === "dialog_request" && ev.request.id === "startup-confirm-1") {
+          expect(adapter.isTransportWritable()).toBe(true);
+          startupDialogHandled = true;
+          void adapter.respondToDialog({ id: ev.request.id, kind: "confirm", confirmed: true });
+        }
+      });
+
+      const meta = await adapter.start({
+        ompExecutablePath: process.execPath,
+        ompArgsPrefix: [script],
+        scope: { kind: "standalone", standaloneCwd: path.join(tmp, "standalone") },
+        approvalMode: "always-ask",
+        requireProtocolV2: true,
+        shutdownTimeoutMs: 2_000,
+      });
+
+      expect(startupDialogHandled).toBe(true);
+      expect(meta.negotiatedProtocolVersion).toBe(2);
+      await adapter.dispose();
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("terminates Job Object grandchildren immediately on unexpected OMP exit and closes handle exactly once", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "omp-adapter-crash-job-"));
+    try {
+      const grandchildPidFile = path.join(tmp, "crash-grandchild.pid");
+      const grandchildScript = writeMockOmpScript(
+        tmp,
+        "crash-grandchild",
+        `setInterval(() => {}, 10000);`,
+      );
+      const script = writeMockOmpScript(
+        tmp,
+        "fake-omp-crash-with-child",
+        `
+const fs = require("node:fs");
+const { spawn } = require("node:child_process");
+const readline = require("node:readline");
+
+const child = spawn(process.execPath, [${JSON.stringify(grandchildScript)}], {
+  stdio: "ignore",
+  windowsHide: true,
+});
+fs.writeFileSync(${JSON.stringify(grandchildPidFile)}, String(child.pid), "utf8");
+
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+send({
+  type: "ready",
+  protocolVersion: 1,
+  supportedProtocolVersions: [1, 2],
+  maxFrameBytes: 1048576,
+  maxReassembledFrameBytes: 67108864,
+  supportsBashExcludeFromContext: true,
+});
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.type === "negotiate_protocol") {
+    send({ id: msg.id, type: "response", command: "negotiate_protocol", success: true, data: { protocolVersion: 2 } });
+  } else if (msg.type === "prompt" && msg.message === "trigger-crash") {
+    send({ id: msg.id, type: "response", command: "prompt", success: true });
+    // Simulate unexpected OMP crash while grandchild tool process is still alive
+    setTimeout(() => process.exit(42), 30);
+  }
+});
+        `,
+      );
+
+      let mockCloseCount = 0;
+      const adapter =
+        process.platform === "win32"
+          ? new OmpRuntimeAdapter()
+          : new OmpRuntimeAdapter({
+              requireJobObject: true,
+              createJobObject: () => {
+                let assigned = false;
+                return {
+                  isAssigned: () => assigned,
+                  assignProcess: () => {
+                    assigned = true;
+                    return { ok: true };
+                  },
+                  terminateAndClose: () => {
+                    if (assigned) {
+                      assigned = false;
+                      mockCloseCount += 1;
+                    }
+                  },
+                };
+              },
+            });
+
+      const exitedPromise = new Promise<OmpAdapterEvent>((resolve) => {
+        adapter.onEvent((ev) => {
+          if (ev.type === "transport_error" && ev.code === "PROCESS_EXITED") {
+            resolve(ev);
+          }
+        });
+      });
+
+      await adapter.start({
+        ompExecutablePath: process.execPath,
+        ompArgsPrefix: [script],
+        scope: { kind: "standalone", standaloneCwd: path.join(tmp, "standalone") },
+        approvalMode: "always-ask",
+        requireProtocolV2: true,
+        shutdownTimeoutMs: 2_000,
+      });
+
+      expect(adapter.isAssignedToJobObject()).toBe(true);
+      await adapter.sendPrompt("trigger-crash");
+
+      const exitEvent = await exitedPromise;
+      expect(exitEvent.type).toBe("transport_error");
+      expect(adapter.isAssignedToJobObject()).toBe(false);
+
+      const grandchildPid = Number.parseInt(fs.readFileSync(grandchildPidFile, "utf8").trim(), 10);
+      expect(grandchildPid).toBeGreaterThan(0);
+
+      if (process.platform === "win32") {
+        // Without calling adapter.dispose(), the Job Object must already have killed the surviving grandchild!
+        await new Promise((r) => setTimeout(r, 150));
+        let alive = false;
+        try {
+          process.kill(grandchildPid, 0);
+          alive = true;
+        } catch {
+          alive = false;
+        }
+        expect(alive).toBe(false);
+      } else {
+        expect(mockCloseCount).toBe(1);
+        try {
+          process.kill(grandchildPid, "SIGKILL");
+        } catch {
+          // already dead
+        }
+      }
+
+      // Subsequent idempotent dispose must not double-close the Job Object handle
+      await adapter.dispose();
+      await adapter.dispose();
+      if (process.platform !== "win32") {
+        expect(mockCloseCount).toBe(1);
+      }
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
+  });
+
+  it("fails closed and terminates child when Job Object assignment fails on a live process", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "omp-adapter-job-fail-"));
+    try {
+      const pidFile = path.join(tmp, "live-child.pid");
+      const liveScript = writeMockOmpScript(
+        tmp,
+        "fake-omp-live",
+        `
+const fs = require("node:fs");
+fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid), "utf8");
+setInterval(() => {}, 10000);
+        `,
+      );
+
+      let assignedPid = 0;
+      const adapter = new OmpRuntimeAdapter({
+        requireJobObject: true,
+        createJobObject: () => ({
+          isAssigned: () => false,
+          assignProcess: (pid: number) => {
+            assignedPid = pid;
+            return {
+              ok: false,
+              reason: "Simulated SetInformationJobObject access denied",
+              processAlreadyExited: false,
+            };
+          },
+          terminateAndClose: () => {},
+        }),
+      });
+
+      const events: OmpAdapterEvent[] = [];
+      adapter.onEvent((e) => events.push(e));
+
+      await expect(
+        adapter.start({
+          ompExecutablePath: process.execPath,
+          ompArgsPrefix: [liveScript],
+          scope: { kind: "standalone", standaloneCwd: path.join(tmp, "standalone") },
+          approvalMode: "always-ask",
+          requireProtocolV2: true,
+          shutdownTimeoutMs: 2_000,
+        }),
+      ).rejects.toThrow(/Failed to assign OMP process.*Job Object/i);
+
+      expect(assignedPid).toBeGreaterThan(0);
+      expect(events.some((e) => e.type === "transport_error" && e.code === "PROCESS_EXITED")).toBe(
+        true,
+      );
+
+      // Confirm the unsupervised child was terminated rather than left running
+      await new Promise((r) => setTimeout(r, 150));
+      let alive = false;
+      try {
+        process.kill(assignedPid, 0);
+        alive = true;
+      } catch {
+        alive = false;
+      }
+      expect(alive).toBe(false);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
+  });
 });

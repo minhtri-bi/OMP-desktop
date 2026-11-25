@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -447,7 +448,7 @@ rl.on("close", () => process.exit(0));
   }
 });
 
-test("Stage 2: NO_CONFIGURED_MODEL onboarding, streaming deltas, approval/secret/ask dialogs, abort, and restart persistence", async () => {
+test("Stage 2: NO_CONFIGURED_MODEL onboarding, startup dialogs, local commands, streaming/approvals/ask validation, abort, session resume, and single-instance lock", async () => {
   const stage2Dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-desktop-e2e-stage2-"));
   const unconfUserData = path.join(stage2Dir, "userdata-unconf");
   const persistUserData = path.join(stage2Dir, "userdata-persist");
@@ -465,9 +466,29 @@ test("Stage 2: NO_CONFIGURED_MODEL onboarding, streaming deltas, approval/secret
   fs.writeFileSync(
     interactiveMockOmp,
     `
+const fs = require("node:fs");
+const path = require("node:path");
 const readline = require("node:readline");
 const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
 
+const argv = process.argv.slice(2);
+const dirIdx = argv.indexOf("--session-dir");
+const sessionDir = dirIdx !== -1 ? argv[dirIdx + 1] : null;
+const hasContinue = argv.includes("--continue");
+const sessionFile = sessionDir ? path.join(sessionDir, "session-history.json") : null;
+
+// Mirror OMP v19.1.1: --session-dir alone starts fresh; only --continue resumes saved runtime context
+let history = [];
+if (sessionFile && hasContinue && fs.existsSync(sessionFile)) {
+  history = JSON.parse(fs.readFileSync(sessionFile, "utf8"));
+}
+const saveHistory = () => {
+  if (sessionFile) {
+    fs.writeFileSync(sessionFile, JSON.stringify(history), "utf8");
+  }
+};
+
+// Emit ready before extension session_start confirmation (exact OMP v19.1.1 ordering)
 send({
   type: "ready",
   version: "19.1.1",
@@ -478,18 +499,98 @@ send({
   supportsBashExcludeFromContext: true,
 });
 
+let startupApproved = history.length > 0;
+let queuedNegotiate = null;
+if (!startupApproved) {
+  send({
+    type: "extension_ui_request",
+    id: "startup-confirm-1",
+    method: "confirm",
+    title: "Initialize workspace extension",
+    message: "Approve session_start hook before negotiation",
+  });
+}
+
 let confirmResult = null;
 let secretLen = 0;
+
+const askQuestions = [
+  {
+    id: "q-env",
+    header: "Environment",
+    question: "Which target should OMP verify?",
+    options: [
+      { label: "Staging", description: "Safe pre-prod check" },
+      { label: "Production", description: "Live check" },
+    ],
+    recommended: 0,
+  },
+  {
+    id: "q-suites",
+    header: "Checks",
+    question: "Which checks should run?",
+    options: [
+      { label: "Unit", description: "Fast unit tests" },
+      { label: "E2E", description: "Electron acceptance" },
+    ],
+    multi: true,
+  },
+];
+
+// Mirror pinned OMP v19.1.1 parseAskDialogResponse validation
+function validateAskAnswers(answers) {
+  if (!Array.isArray(answers) || answers.length !== askQuestions.length) {
+    throw new Error("Ask response answer count mismatch");
+  }
+  return askQuestions.map((q, idx) => {
+    const ans = answers[idx];
+    if (!ans || ans.id !== q.id) throw new Error("Ask answer id mismatch");
+    const labels = q.options.map((o) => o.label);
+    const multi = q.multi === true;
+    const selected = Array.isArray(ans.selectedOptions) ? ans.selectedOptions : null;
+    if (!selected) throw new Error("selectedOptions must be an array");
+    for (const label of selected) {
+      if (!labels.includes(label)) throw new Error("Unknown option label: " + label);
+    }
+    const custom = typeof ans.customInput === "string" ? ans.customInput.trim() || undefined : undefined;
+    if (!multi && (selected.length > 1 || (selected.length > 0 && custom !== undefined))) {
+      throw new Error("Single-select question " + q.id + " cannot carry both selectedOptions and customInput");
+    }
+    return { id: q.id, selectedOptions: selected, customInput: custom };
+  });
+}
 
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   const msg = JSON.parse(line);
-  if (msg.type === "negotiate_protocol") {
-    send({ id: msg.id, type: "response", command: "negotiate_protocol", success: true, data: { protocolVersion: 2 } });
+  if (msg.type === "extension_ui_response" && msg.id === "startup-confirm-1") {
+    startupApproved = msg.confirmed === true;
+    if (queuedNegotiate) {
+      send({
+        id: queuedNegotiate.id,
+        type: "response",
+        command: "negotiate_protocol",
+        success: startupApproved,
+        data: { protocolVersion: 2 },
+      });
+      queuedNegotiate = null;
+    }
+  } else if (msg.type === "negotiate_protocol") {
+    if (startupApproved) {
+      send({ id: msg.id, type: "response", command: "negotiate_protocol", success: true, data: { protocolVersion: 2 } });
+    } else {
+      queuedNegotiate = msg;
+    }
   } else if (msg.type === "set_ask_dialog") {
     send({ id: msg.id, type: "response", command: "set_ask_dialog", success: true });
+  } else if (msg.type === "prompt" && msg.message === "/session info") {
+    // Local command ack: explicit agentInvoked: false and NO prompt_result
+    send({ id: msg.id, type: "response", command: "prompt", success: true, data: { agentInvoked: false } });
   } else if (msg.type === "prompt" && msg.message === "test-approvals-and-stream") {
-    send({ id: msg.id, type: "response", command: "prompt", success: true, data: { agentInvoked: true } });
+    // Regular prompt ack omits data entirely (matching OMP v19.1.1)
+    history.push({ role: "user", text: "codename=Falcon:" + msg.message });
+    saveHistory();
+    send({ id: msg.id, type: "response", command: "prompt", success: true });
     send({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "Checking " } });
     send({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "permissions..." } });
     send({
@@ -515,41 +616,59 @@ rl.on("line", (line) => {
       type: "extension_ui_request",
       id: "ask-1",
       method: "ask",
-      questions: [
-        {
-          id: "q-env",
-          header: "Environment",
-          question: "Which target should OMP verify?",
-          options: [
-            { label: "Staging", description: "Safe pre-prod check" },
-            { label: "Production", description: "Live check" },
-          ],
-          recommended: 0,
-        },
-      ],
+      questions: askQuestions,
     });
   } else if (msg.type === "extension_ui_response" && msg.id === "ask-1") {
-    const ans = Array.isArray(msg.answers) ? msg.answers[0] : null;
-    const summary =
-      "Completed turn: confirmed=" +
-      String(confirmResult) +
-      ", secretLen=" +
-      String(secretLen) +
-      ", askChoice=" +
-      (ans && ans.selectedOptions ? ans.selectedOptions.join("+") : "none") +
-      ", askCustom=" +
-      (ans && ans.customInput ? ans.customInput : "none");
+    let summary;
+    try {
+      const validated = validateAskAnswers(msg.answers);
+      const q1 = validated[0];
+      const q2 = validated[1];
+      summary =
+        "Completed turn: confirmed=" +
+        String(confirmResult) +
+        ", secretLen=" +
+        String(secretLen) +
+        ", q1Selected=" +
+        (q1.selectedOptions.length > 0 ? q1.selectedOptions.join("+") : "empty") +
+        ", q1Custom=" +
+        (q1.customInput || "none") +
+        ", q2Selected=" +
+        (q2.selectedOptions.length > 0 ? q2.selectedOptions.join("+") : "empty") +
+        ", q2Custom=" +
+        (q2.customInput || "none");
+    } catch (err) {
+      summary = "ASK_VALIDATION_ERROR: " + String(err.message || err);
+    }
+    history.push({ role: "assistant", text: summary });
+    saveHistory();
     send({
       type: "message_end",
       message: { role: "assistant", content: [{ type: "text", text: summary }] },
     });
     send({ type: "prompt_result", agentInvoked: true, status: "completed", sessionSettled: true });
   } else if (msg.type === "prompt" && msg.message === "test-abort-stream") {
-    send({ id: msg.id, type: "response", command: "prompt", success: true, data: { agentInvoked: true } });
+    send({ id: msg.id, type: "response", command: "prompt", success: true });
     send({
       type: "message_update",
       assistantMessageEvent: { type: "text_delta", delta: "Streaming step before abort" },
     });
+  } else if (msg.type === "prompt" && msg.message === "recall-context") {
+    send({ id: msg.id, type: "response", command: "prompt", success: true });
+    const hasFalcon = history.some((entry) => String(entry.text || "").includes("codename=Falcon"));
+    const reply =
+      "Resumed runtime context: historyLen=" +
+      String(history.length) +
+      ", sawFalcon=" +
+      String(hasFalcon);
+    history.push({ role: "user", text: msg.message });
+    history.push({ role: "assistant", text: reply });
+    saveHistory();
+    send({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: reply }] },
+    });
+    send({ type: "prompt_result", agentInvoked: true, status: "completed", sessionSettled: true });
   } else if (msg.type === "abort") {
     send({ id: msg.id, type: "response", command: "abort", success: true });
     send({ type: "prompt_result", agentInvoked: true, status: "aborted", sessionSettled: true });
@@ -590,7 +709,8 @@ rl.on("close", () => process.exit(0));
       await appUnconf.close();
     }
 
-    // 2. Verify live streaming, confirm/secret/ask dialogs, abort button, and draft/chat persistence
+    // 2. Verify startup session_start dialog, local command (agentInvoked: false), streaming,
+    //    confirm/secret/ask validation, abort button, and draft/chat persistence
     const appLive = await electron.launch({
       args: launchArgs,
       env: {
@@ -605,6 +725,20 @@ rl.on("close", () => process.exit(0));
       const winLive = await appLive.firstWindow();
       await winLive.waitForLoadState("domcontentloaded");
 
+      // Send a local command `/session info` first -> triggers startup `session_start` confirm dialog!
+      await winLive.getByTestId("composer-input").fill("/session info");
+      await winLive.getByTestId("composer-send-btn").click();
+
+      // Startup dialog must be answerable BEFORE protocol negotiation completes!
+      await expect(winLive.getByTestId("dialog-card-startup-confirm-1")).toBeVisible();
+      await winLive.getByTestId("dialog-approve-btn").click();
+      await expect(winLive.getByTestId("dialog-card-startup-confirm-1")).toHaveCount(0);
+
+      // Local command finishes with agentInvoked: false -> composer MUST unlock (no Stop lockout!)
+      await expect(winLive.getByTestId("composer-abort-btn")).toBeHidden();
+      await expect(winLive.getByTestId("composer-send-btn")).toBeEnabled();
+
+      // Now send a full streaming + approval + secret + ask prompt
       await winLive.getByTestId("composer-input").fill("test-approvals-and-stream");
       await winLive.getByTestId("composer-send-btn").click();
 
@@ -624,14 +758,21 @@ rl.on("close", () => process.exit(0));
       await secretInput.fill("s3cr3t-tok");
       await winLive.getByTestId("dialog-submit-btn").click();
 
-      // Structured ask dialog renders recommended choice and custom write-in
+      // Structured ask dialog:
+      // - Single-choice q-env write-in automatically unchecks preset Staging & checks Other (mutually exclusive!)
+      // - Multi-select q-suites allows BOTH checking Unit AND writing "nightly"
       await expect(winLive.getByTestId("dialog-card-ask-1")).toBeVisible();
       await winLive.getByTestId("dialog-ask-custom-q-env").fill("smoke-check");
+      await expect(winLive.getByTestId("dialog-ask-opt-q-env-0")).not.toBeChecked();
+      await expect(winLive.getByTestId("dialog-ask-other-q-env")).toBeChecked();
+      await winLive.getByTestId("dialog-ask-opt-q-suites-0").check();
+      await winLive.getByTestId("dialog-ask-custom-q-suites").fill("nightly");
       await winLive.getByTestId("dialog-submit-btn").click();
 
       await expect(winLive.getByTestId("chat-transcript")).toContainText(
-        "Completed turn: confirmed=true, secretLen=10, askChoice=Staging, askCustom=smoke-check",
+        "Completed turn: confirmed=true, secretLen=10, q1Selected=empty, q1Custom=smoke-check, q2Selected=Unit, q2Custom=nightly",
       );
+      await expect(winLive.getByTestId("chat-transcript")).not.toContainText("ASK_VALIDATION_ERROR");
       await expect(winLive.getByTestId("chat-transcript")).not.toContainText("s3cr3t-tok");
       await expect(winLive.getByTestId("composer-abort-btn")).toBeHidden();
 
@@ -654,7 +795,10 @@ rl.on("close", () => process.exit(0));
       await appLive.close();
     }
 
-    // 3. Relaunch Electron with the SAME userData directory and confirm transcripts + draft persisted
+    // 3. Relaunch Electron with the SAME userData directory and confirm:
+    //    - desktop transcript & draft restored
+    //    - relaunched OMP runtime ACTUALLY resumed session history (--session-dir + --continue)
+    //    - launching a second Electron instance with the same userData exits cleanly without overwriting state
     const appRestarted = await electron.launch({
       args: launchArgs,
       env: {
@@ -670,12 +814,47 @@ rl.on("close", () => process.exit(0));
       await winRestarted.waitForLoadState("domcontentloaded");
 
       await expect(winRestarted.getByTestId("chat-transcript")).toContainText(
-        "Completed turn: confirmed=true, secretLen=10, askChoice=Staging, askCustom=smoke-check",
+        "Completed turn: confirmed=true, secretLen=10, q1Selected=empty, q1Custom=smoke-check, q2Selected=Unit, q2Custom=nightly",
       );
       await expect(winRestarted.getByTestId("chat-transcript")).toContainText("[Turn aborted]");
       await expect(winRestarted.getByTestId("composer-input")).toHaveValue(
         "persisted-draft-across-restart",
       );
+
+      // Send a follow-up turn after restart and prove the runtime session resumed earlier model context
+      await winRestarted.getByTestId("composer-input").fill("recall-context");
+      await winRestarted.getByTestId("composer-send-btn").click();
+      await expect(winRestarted.getByTestId("chat-transcript")).toContainText(
+        "Resumed runtime context: historyLen=2, sawFalcon=true",
+      );
+
+      // Verify single-instance lock: a second Electron instance sharing persistUserData exits promptly
+      // without touching desktop-state.json
+      const stateFilePath = path.join(persistUserData, "desktop-state.json");
+      const stateBeforeSecondLaunch = fs.readFileSync(stateFilePath, "utf8");
+      const electronBinary = await appRestarted.evaluate(() => process.execPath);
+      const secondExitCode = await new Promise<number | null>((resolve, reject) => {
+        const secondProc = spawn(electronBinary, launchArgs, {
+          env: {
+            ...process.env,
+            OMP_DESKTOP_FIXTURE_ROOT: fixtureCopyRoot,
+            OMP_DESKTOP_USER_DATA: persistUserData,
+          },
+          stdio: "ignore",
+          windowsHide: true,
+        });
+        const timer = setTimeout(() => {
+          secondProc.kill();
+          reject(new Error("Second Electron instance did not exit within timeout"));
+        }, 10_000);
+        secondProc.once("exit", (code) => {
+          clearTimeout(timer);
+          resolve(code);
+        });
+      });
+      expect(secondExitCode).toBe(0);
+      expect(fs.readFileSync(stateFilePath, "utf8")).toBe(stateBeforeSecondLaunch);
+      expect(stateBeforeSecondLaunch).toContain("Resumed runtime context: historyLen=2, sawFalcon=true");
     } finally {
       await appRestarted.close();
     }

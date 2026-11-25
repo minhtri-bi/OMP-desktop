@@ -1,9 +1,11 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { app, BrowserWindow, dialog, ipcMain } from "electron";
 import type {
   BootstrapPayload,
   ChatLinkItem,
+  ChatMessage,
   ChatThread,
   ChatWorkspaceBinding,
   FolderEntry,
@@ -21,14 +23,29 @@ import { OmpRuntimeAdapter } from "./omp-adapter";
 import {
   authorizeCanonicalReadPath,
   canonicalizeExistingPath,
+  deriveWorkspaceDisplayName,
   normalizeForComparison,
   resolveMessageFileLink,
 } from "./path-resolver";
 import { IsolatedPreviewManager, registerPreviewProtocolScheme } from "./preview-manager";
-import { DesktopStateStore } from "./state-store";
+import {
+  allocateWorkspaceId,
+  DesktopStateStore,
+  findMatchingProjectChat,
+} from "./state-store";
 
 // Must be called synchronously BEFORE app.whenReady()
 registerPreviewProtocolScheme();
+
+// Configure isolated userData path BEFORE acquiring the single-instance lock so distinct test
+// profiles do not block each other while two launches sharing one profile enforce a single writer.
+if (process.env.OMP_DESKTOP_USER_DATA) {
+  const customUserData = path.resolve(process.env.OMP_DESKTOP_USER_DATA);
+  fs.mkdirSync(customUserData, { recursive: true });
+  app.setPath("userData", customUserData);
+}
+
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
 
 const MAX_SOURCE_BYTES = 2 * 1024 * 1024;
 const MAX_PDF_BYTES = 50 * 1024 * 1024;
@@ -38,6 +55,7 @@ let previewManager: IsolatedPreviewManager | null = null;
 let stateStore: DesktopStateStore | null = null;
 const adaptersByChatId = new Map<string, OmpRuntimeAdapter>();
 const startingAdaptersByChatId = new Map<string, Promise<OmpRuntimeAdapter>>();
+const startingAdapterInstancesByChatId = new Map<string, OmpRuntimeAdapter>();
 
 const workspaces = new Map<string, WorkspaceDescriptor>();
 const chats = new Map<string, ChatThread>();
@@ -69,6 +87,31 @@ function persistState(): void {
   }
 }
 
+function appendAndPersistChatMessage(chatId: string, message: ChatMessage): ChatMessage | null {
+  const targetChat = chats.get(chatId);
+  if (!targetChat) {
+    return null;
+  }
+  targetChat.messages.push(message);
+  persistState();
+  return message;
+}
+
+function broadcastChatMessage(chatId: string, message: ChatMessage): void {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("omp-desktop:chat-message", { chatId, message });
+  }
+}
+
+function sessionDirForChat(chatId: string): string {
+  const sanitized = chatId.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const key =
+    sanitized === chatId
+      ? sanitized
+      : `${sanitized}-${crypto.createHash("sha256").update(chatId).digest("hex").slice(0, 8)}`;
+  return path.join(app.getPath("userData"), "omp-sessions", key);
+}
+
 function languageForPath(filePath: string): string {
   const ext = path.extname(filePath).toLowerCase();
   const map: Record<string, string> = {
@@ -98,13 +141,11 @@ function addWorkspace(rootPath: string, explicitId?: string, explicitName?: stri
       return existing;
     }
   }
-  let workspaceId = explicitId ?? `ws-${workspaces.size + 1}`;
-  let seq = workspaces.size + 1;
-  while (!explicitId && workspaces.has(workspaceId)) {
-    seq += 1;
-    workspaceId = `ws-${seq}`;
-  }
-  const displayName = explicitName ?? path.basename(canonicalRoot);
+  const workspaceId = allocateWorkspaceId(workspaces.values(), chats.values(), explicitId);
+  const displayName =
+    explicitName && explicitName.trim()
+      ? explicitName
+      : deriveWorkspaceDisplayName(canonicalRoot);
   const descriptor: WorkspaceDescriptor = {
     workspaceId,
     workspaceRoot: canonicalRoot,
@@ -263,13 +304,9 @@ function authorizeFileAccess(canonicalPath: string, owningBinding: ChatWorkspace
 
 function getOrCreateProjectChat(ws: WorkspaceDescriptor, forceNew = false): ChatThread {
   if (!forceNew) {
-    for (const existing of chats.values()) {
-      if (
-        existing.owningBinding.kind === "project" &&
-        existing.owningBinding.workspaceId === ws.workspaceId
-      ) {
-        return existing;
-      }
+    const existing = findMatchingProjectChat(chats.values(), ws);
+    if (existing) {
+      return existing;
     }
   }
   let seq = chats.size + 1;
@@ -355,7 +392,7 @@ function registerIpcHandlers(): void {
               kind: "project",
               workspaceId: "explorer",
               workspaceRoot: realRoot,
-              workspaceDisplayName: path.basename(realRoot),
+              workspaceDisplayName: deriveWorkspaceDisplayName(realRoot),
             },
             rawTarget: relativeDir,
           })
@@ -549,15 +586,16 @@ function registerIpcHandlers(): void {
       return { ok: false, error: "Prompt text cannot be empty." };
     }
 
-    // Record user turn and clear persisted draft immediately
-    chat.messages.push({
+    // Main process is the single source of truth for transcript messages and persistence.
+    chat.composerDraft = "";
+    const userMessage: ChatMessage = {
       messageId: `user-${Date.now()}-${chat.messages.length}`,
       role: "user",
       text: trimmed,
       isRestoredMessage: false,
-    });
-    chat.composerDraft = "";
-    persistState();
+    };
+    appendAndPersistChatMessage(chatId, userMessage);
+    broadcastChatMessage(chatId, userMessage);
 
     const ensureRunningAdapter = async (): Promise<OmpRuntimeAdapter> => {
       const existing = adaptersByChatId.get(chatId);
@@ -610,8 +648,13 @@ function registerIpcHandlers(): void {
         }
 
         const adapter = new OmpRuntimeAdapter();
+        // Register the starting instance immediately so extension `session_start` dialogs
+        // can receive `extension_ui_response` frames before protocol v2 negotiation completes.
+        startingAdapterInstancesByChatId.set(chatId, adapter);
+
         let adapterPartialText = "";
         adapter.onEvent((ev) => {
+          let appendedMessage: ChatMessage | null = null;
           if (ev.type === "ready") {
             diagnostics.ompStatus = "ready";
             diagnostics.ompVersion = ev.metadata.ompVersion;
@@ -627,14 +670,13 @@ function registerIpcHandlers(): void {
             if (targetChat && extracted) {
               const messageId = `omp-${Date.now()}-${targetChat.messages.length}`;
               const parsedLinks = parseReplyLinks(extracted.text, messageId);
-              targetChat.messages.push({
+              appendedMessage = appendAndPersistChatMessage(chatId, {
                 messageId,
                 role: extracted.role,
                 text: extracted.text,
                 links: parsedLinks.length > 0 ? parsedLinks : undefined,
                 isRestoredMessage: false,
               });
-              persistState();
             }
           } else if (ev.type === "prompt_result") {
             const trimmedPartial = adapterPartialText.trim();
@@ -645,7 +687,7 @@ function registerIpcHandlers(): void {
                 if (trimmedPartial.length > 0) {
                   const messageId = `omp-aborted-${Date.now()}-${targetChat.messages.length}`;
                   const parsedLinks = parseReplyLinks(trimmedPartial, messageId);
-                  targetChat.messages.push({
+                  appendedMessage = appendAndPersistChatMessage(chatId, {
                     messageId,
                     role: "assistant",
                     text: `${trimmedPartial}\n\n[Turn aborted]`,
@@ -653,14 +695,13 @@ function registerIpcHandlers(): void {
                     isRestoredMessage: false,
                   });
                 } else {
-                  targetChat.messages.push({
+                  appendedMessage = appendAndPersistChatMessage(chatId, {
                     messageId: `sys-aborted-${Date.now()}-${targetChat.messages.length}`,
                     role: "system",
                     text: "Turn aborted.",
                     isRestoredMessage: false,
                   });
                 }
-                persistState();
               }
             }
           } else if (ev.type === "session_settled") {
@@ -676,41 +717,62 @@ function registerIpcHandlers(): void {
               diagnostics.ompStatus = "error";
               diagnostics.lastError = ev.message;
             }
-            if (!ev.recoverable && adaptersByChatId.get(chatId) === adapter) {
-              diagnostics.promptRequestCount += adapter.getPromptRequestCount();
-              adaptersByChatId.delete(chatId);
+            if (!ev.recoverable) {
+              if (adaptersByChatId.get(chatId) === adapter) {
+                diagnostics.promptRequestCount += adapter.getPromptRequestCount();
+                adaptersByChatId.delete(chatId);
+              }
+              if (startingAdapterInstancesByChatId.get(chatId) === adapter) {
+                startingAdapterInstancesByChatId.delete(chatId);
+              }
+              // Ensure idempotent disposal (including Job Object cleanup) on every fatal eviction.
+              void adapter.dispose();
             }
           }
-          mainWindow?.webContents.send("omp-desktop:omp-event", { chatId, event: ev });
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send("omp-desktop:omp-event", { chatId, event: ev });
+          }
+          if (appendedMessage) {
+            broadcastChatMessage(chatId, appendedMessage);
+          }
         });
 
         const standaloneCwd = path.join(app.getPath("userData"), "standalone-cwd");
-        const safeSessionKey = chatId.replace(/[^a-zA-Z0-9._-]/g, "_");
-        const sessionDir = path.join(app.getPath("userData"), "omp-sessions", safeSessionKey);
+        const sessionDir = sessionDirForChat(chatId);
 
-        await adapter.start({
-          ompExecutablePath: ompBin,
-          ompArgsPrefix,
-          scope:
-            chat.owningBinding.kind === "project"
-              ? {
-                  kind: "project",
-                  workspaceId: chat.owningBinding.workspaceId,
-                  canonicalWorkspaceRoot: canonicalizeExistingPath(chat.owningBinding.workspaceRoot),
-                }
-              : {
-                  kind: "standalone",
-                  standaloneCwd,
-                },
-          approvalMode: "always-ask",
-          sessionDir,
-          supportsFormDialog: false,
-          supportsAskDialog: true,
-          requireProtocolV2: true,
-          shutdownTimeoutMs: 5_000,
-        });
-        adaptersByChatId.set(chatId, adapter);
-        return adapter;
+        try {
+          await adapter.start({
+            ompExecutablePath: ompBin,
+            ompArgsPrefix,
+            scope:
+              chat.owningBinding.kind === "project"
+                ? {
+                    kind: "project",
+                    workspaceId: chat.owningBinding.workspaceId,
+                    canonicalWorkspaceRoot: canonicalizeExistingPath(chat.owningBinding.workspaceRoot),
+                  }
+                : {
+                    kind: "standalone",
+                    standaloneCwd,
+                  },
+            approvalMode: "always-ask",
+            sessionDir,
+            resumeSession: true,
+            supportsFormDialog: false,
+            supportsAskDialog: true,
+            requireProtocolV2: true,
+            shutdownTimeoutMs: 5_000,
+          });
+          if (!adapter.isRunning()) {
+            throw new Error("OMP runtime exited before startup completed.");
+          }
+          adaptersByChatId.set(chatId, adapter);
+          return adapter;
+        } finally {
+          if (startingAdapterInstancesByChatId.get(chatId) === adapter) {
+            startingAdapterInstancesByChatId.delete(chatId);
+          }
+        }
       })();
 
       startingAdaptersByChatId.set(chatId, startPromise);
@@ -730,8 +792,8 @@ function registerIpcHandlers(): void {
     }
 
     try {
-      await adapter.sendPrompt(trimmed);
-      return { ok: true };
+      const promptRes = await adapter.sendPrompt(trimmed);
+      return { ok: true, agentInvoked: promptRes.agentInvoked };
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }
@@ -750,8 +812,10 @@ function registerIpcHandlers(): void {
       if (!response || typeof response !== "object" || typeof response.id !== "string" || !response.id) {
         return { ok: false, error: "Invalid dialog response payload." };
       }
-      const adapter = adaptersByChatId.get(chatId);
-      if (!adapter || !adapter.isRunning()) {
+      // Permit dialog responses for both running and starting adapters as soon as stdin is writable,
+      // so startup `session_start` extension dialogs can unblock protocol negotiation.
+      const adapter = adaptersByChatId.get(chatId) ?? startingAdapterInstancesByChatId.get(chatId);
+      if (!adapter || !adapter.isTransportWritable()) {
         return { ok: false, error: "OMP runtime is not active for this chat." };
       }
       try {
@@ -838,37 +902,54 @@ async function createMainWindow(): Promise<void> {
   await mainWindow.loadFile(rendererHtml);
 }
 
-app.whenReady().then(async () => {
-  if (process.env.OMP_DESKTOP_USER_DATA) {
-    app.setPath("userData", path.resolve(process.env.OMP_DESKTOP_USER_DATA));
-  }
-  stateStore = new DesktopStateStore(app.getPath("userData"));
-  initializeFixtureOrDefaultState();
-  registerIpcHandlers();
-  await createMainWindow();
-});
-
 let quitPhase: "idle" | "disposing" | "ready" = "idle";
 
-app.on("before-quit", (event) => {
-  if (quitPhase === "ready") {
-    return;
-  }
-  event.preventDefault();
-  if (quitPhase === "disposing") {
-    return;
-  }
-  quitPhase = "disposing";
-  persistState();
-  previewManager?.disposeAll();
-  const activeAdapters = Array.from(adaptersByChatId.values());
-  adaptersByChatId.clear();
-  void Promise.allSettled(activeAdapters.map((adapter) => adapter.dispose())).finally(() => {
-    quitPhase = "ready";
+if (!hasSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      if (mainWindow.isMinimized()) {
+        mainWindow.restore();
+      }
+      mainWindow.show();
+      mainWindow.focus();
+    }
+  });
+
+  app.whenReady().then(async () => {
+    stateStore = new DesktopStateStore(app.getPath("userData"));
+    initializeFixtureOrDefaultState();
+    registerIpcHandlers();
+    await createMainWindow();
+  });
+
+  app.on("before-quit", (event) => {
+    if (quitPhase === "ready") {
+      return;
+    }
+    event.preventDefault();
+    if (quitPhase === "disposing") {
+      return;
+    }
+    quitPhase = "disposing";
+    persistState();
+    previewManager?.disposeAll();
+    const activeAdapters = Array.from(
+      new Set<OmpRuntimeAdapter>([
+        ...adaptersByChatId.values(),
+        ...startingAdapterInstancesByChatId.values(),
+      ]),
+    );
+    adaptersByChatId.clear();
+    startingAdapterInstancesByChatId.clear();
+    void Promise.allSettled(activeAdapters.map((adapter) => adapter.dispose())).finally(() => {
+      quitPhase = "ready";
+      app.quit();
+    });
+  });
+
+  app.on("window-all-closed", () => {
     app.quit();
   });
-});
-
-app.on("window-all-closed", () => {
-  app.quit();
-});
+}

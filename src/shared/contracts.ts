@@ -10,6 +10,8 @@ export interface OmpProcessConfig {
   scope: ChatScope;
   approvalMode: OmpApprovalMode;
   sessionDir?: string;
+  /** Resume the latest session in sessionDir via --continue (defaults to true when sessionDir is set). */
+  resumeSession?: boolean;
   agentDirOverride?: string;
   modelOverride?: string;
   /** Explicit opt-in when the UI implements a safe declarative form renderer; defaults to false (auto-cancel forms). */
@@ -290,7 +292,7 @@ export interface DesktopBridgeApi {
   closeIsolatedView(tabKey: string): Promise<void>;
   attachStandaloneFileDialog(chatId: string): Promise<string | null>;
   getDiagnostics(): Promise<RuntimeDiagnostics>;
-  sendPrompt(chatId: string, text: string): Promise<{ ok: boolean; error?: string }>;
+  sendPrompt(chatId: string, text: string): Promise<{ ok: boolean; agentInvoked?: boolean; error?: string }>;
   abortTurn(chatId: string): Promise<void>;
   respondToDialog(chatId: string, response: OmpDialogResponse): Promise<{ ok: boolean; error?: string }>;
   syncUiState(update: {
@@ -298,5 +300,6 @@ export interface DesktopBridgeApi {
     activeChatId?: string;
     draftUpdate?: { chatId: string; draft: string };
   }): Promise<void>;
+  onChatMessage(listener: (payload: { chatId: string; message: ChatMessage }) => void): () => void;
   onOmpEvent(listener: (event: { chatId: string; event: OmpAdapterEvent }) => void): () => void;
 }

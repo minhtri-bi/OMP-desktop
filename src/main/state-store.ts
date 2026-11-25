@@ -10,7 +10,9 @@ import type {
 } from "../shared/contracts";
 import {
   canonicalizeExistingPath,
+  deriveWorkspaceDisplayName,
   isAbsolutePathCrossPlatform,
+  normalizeForComparison,
   normalizePathSlashes,
 } from "./path-resolver";
 
@@ -20,6 +22,57 @@ export interface PersistedDesktopState {
   activeWorkspaceId: string | null;
   chats: ChatThread[];
   activeChatId: string;
+}
+
+/**
+ * Allocates a workspace ID that does not collide with any active workspace OR any retained
+ * project chat binding (including chats whose original workspace directory is temporarily unavailable).
+ */
+export function allocateWorkspaceId(
+  workspaces: Iterable<WorkspaceDescriptor>,
+  chats: Iterable<ChatThread>,
+  explicitId?: string,
+): string {
+  if (explicitId) {
+    return explicitId;
+  }
+  const reserved = new Set<string>();
+  for (const ws of workspaces) {
+    reserved.add(ws.workspaceId);
+  }
+  for (const chat of chats) {
+    if (chat.owningBinding.kind === "project") {
+      reserved.add(chat.owningBinding.workspaceId);
+    }
+  }
+  let seq = 1;
+  let candidate = `ws-${seq}`;
+  while (reserved.has(candidate)) {
+    seq += 1;
+    candidate = `ws-${seq}`;
+  }
+  return candidate;
+}
+
+/**
+ * Finds an existing project chat matching BOTH workspaceId and canonical workspaceRoot,
+ * preventing a newly opened folder from ever inheriting an unrelated retained chat.
+ */
+export function findMatchingProjectChat(
+  chats: Iterable<ChatThread>,
+  workspace: WorkspaceDescriptor,
+): ChatThread | undefined {
+  const targetRoot = normalizeForComparison(workspace.workspaceRoot);
+  for (const existing of chats) {
+    if (
+      existing.owningBinding.kind === "project" &&
+      existing.owningBinding.workspaceId === workspace.workspaceId &&
+      normalizeForComparison(existing.owningBinding.workspaceRoot) === targetRoot
+    ) {
+      return existing;
+    }
+  }
+  return undefined;
 }
 
 function isSafeLocalRootSyntax(candidate: string): boolean {
@@ -42,8 +95,7 @@ function validateAndCanonicalizeWorkspace(raw: unknown): WorkspaceDescriptor | n
     !rec.workspaceId ||
     typeof rec.workspaceRoot !== "string" ||
     !isSafeLocalRootSyntax(rec.workspaceRoot) ||
-    typeof rec.displayName !== "string" ||
-    !rec.displayName
+    typeof rec.displayName !== "string"
   ) {
     return null;
   }
@@ -54,10 +106,13 @@ function validateAndCanonicalizeWorkspace(raw: unknown): WorkspaceDescriptor | n
       return null;
     }
     const canonicalRoot = canonicalizeExistingPath(rec.workspaceRoot);
+    const displayName = rec.displayName.trim()
+      ? rec.displayName
+      : deriveWorkspaceDisplayName(canonicalRoot);
     return {
       workspaceId: rec.workspaceId,
       workspaceRoot: canonicalRoot,
-      displayName: rec.displayName,
+      displayName,
     };
   } catch {
     return null;
@@ -123,8 +178,7 @@ function sanitizeBinding(raw: unknown, fallbackChatId: string): ChatWorkspaceBin
       !rec.workspaceId ||
       typeof rec.workspaceRoot !== "string" ||
       !isSafeLocalRootSyntax(rec.workspaceRoot) ||
-      typeof rec.workspaceDisplayName !== "string" ||
-      !rec.workspaceDisplayName
+      typeof rec.workspaceDisplayName !== "string"
     ) {
       return null;
     }
@@ -139,11 +193,15 @@ function sanitizeBinding(raw: unknown, fallbackChatId: string): ChatWorkspaceBin
     } catch {
       // keep recorded rootToStore so resolver surfaces WORKSPACE_UNAVAILABLE cleanly
     }
+    // Normalize empty display names (e.g. drive roots like D:\ saved with empty basename) so chats are retained.
+    const workspaceDisplayName = rec.workspaceDisplayName.trim()
+      ? rec.workspaceDisplayName
+      : deriveWorkspaceDisplayName(rootToStore);
     return {
       kind: "project",
       workspaceId: rec.workspaceId,
       workspaceRoot: rootToStore,
-      workspaceDisplayName: rec.workspaceDisplayName,
+      workspaceDisplayName,
     };
   }
 
@@ -180,13 +238,20 @@ function sanitizeChat(raw: unknown): ChatThread | null {
     return null;
   }
   const rec = raw as Record<string, unknown>;
-  if (typeof rec.chatId !== "string" || !rec.chatId || typeof rec.title !== "string" || !rec.title) {
+  if (typeof rec.chatId !== "string" || !rec.chatId || typeof rec.title !== "string") {
     return null;
   }
   const binding = sanitizeBinding(rec.owningBinding, rec.chatId);
   if (!binding) {
     return null;
   }
+  const trimmedTitle = rec.title.trim();
+  const normalizedTitle =
+    trimmedTitle && trimmedTitle !== "Chat"
+      ? rec.title
+      : binding.kind === "project"
+        ? `${binding.workspaceDisplayName} Chat`
+        : "Standalone Chat";
 
   const rawMessages = Array.isArray(rec.messages) ? rec.messages : [];
   const messages: ChatMessage[] = [];
@@ -216,7 +281,7 @@ function sanitizeChat(raw: unknown): ChatThread | null {
 
   return {
     chatId: rec.chatId,
-    title: rec.title,
+    title: normalizedTitle,
     owningBinding: binding,
     messages,
     composerDraft: typeof rec.composerDraft === "string" ? rec.composerDraft : "",

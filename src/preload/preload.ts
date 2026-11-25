@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type {
+  ChatMessage,
   ChatWorkspaceBinding,
   DesktopBridgeApi,
   MessageFileLinkRequest,
@@ -39,6 +40,18 @@ const bridge: DesktopBridgeApi = {
   respondToDialog: (chatId, response) =>
     ipcRenderer.invoke("omp-desktop:respond-dialog", chatId, response),
   syncUiState: (update) => ipcRenderer.invoke("omp-desktop:sync-ui-state", update),
+  onChatMessage: (listener: (payload: { chatId: string; message: ChatMessage }) => void) => {
+    const wrapped = (
+      _ev: Electron.IpcRendererEvent,
+      payload: { chatId: string; message: ChatMessage },
+    ) => {
+      listener(payload);
+    };
+    ipcRenderer.on("omp-desktop:chat-message", wrapped);
+    return () => {
+      ipcRenderer.removeListener("omp-desktop:chat-message", wrapped);
+    };
+  },
   onOmpEvent: (listener: (event: { chatId: string; event: OmpAdapterEvent }) => void) => {
     const wrapped = (_ev: Electron.IpcRendererEvent, payload: { chatId: string; event: OmpAdapterEvent }) => {
       listener(payload);

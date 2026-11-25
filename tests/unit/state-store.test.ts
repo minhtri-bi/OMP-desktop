@@ -2,8 +2,17 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { canonicalizeExistingPath, resolveMessageFileLink } from "../../src/main/path-resolver";
-import { DesktopStateStore } from "../../src/main/state-store";
+import {
+  canonicalizeExistingPath,
+  deriveWorkspaceDisplayName,
+  resolveMessageFileLink,
+} from "../../src/main/path-resolver";
+import {
+  allocateWorkspaceId,
+  DesktopStateStore,
+  findMatchingProjectChat,
+} from "../../src/main/state-store";
+import { buildAskQuestionAnswer } from "../../src/renderer/dialog-cards";
 import { extractAssistantText, extractStreamingUpdateText } from "../../src/shared/omp-message";
 
 describe("DesktopStateStore (durable workspace & chat persistence)", () => {
@@ -72,26 +81,29 @@ describe("DesktopStateStore (durable workspace & chat persistence)", () => {
     }
   });
 
-  it("handles deleted workspaces and corrupt state files gracefully without crashing startup", () => {
+  it("handles deleted workspaces, reserves their workspace IDs, and requires canonical root match before reusing a chat", () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "omp-state-missing-ws-"));
     try {
       const wsGone = path.join(tmp, "deleted-ws");
+      const wsNew = path.join(tmp, "new-ws");
       const userDataDir = path.join(tmp, "user-data");
       fs.mkdirSync(wsGone, { recursive: true });
+      fs.mkdirSync(wsNew, { recursive: true });
       const canonicalGone = canonicalizeExistingPath(wsGone);
+      const canonicalNew = canonicalizeExistingPath(wsNew);
 
       const store = new DesktopStateStore(userDataDir);
       store.save({
-        workspaces: [{ workspaceId: "ws-gone", workspaceRoot: canonicalGone, displayName: "deleted-ws" }],
-        activeWorkspaceId: "ws-gone",
-        activeChatId: "chat-gone",
+        workspaces: [{ workspaceId: "ws-1", workspaceRoot: canonicalGone, displayName: "deleted-ws" }],
+        activeWorkspaceId: "ws-1",
+        activeChatId: "chat-ws-1-1",
         chats: [
           {
-            chatId: "chat-gone",
+            chatId: "chat-ws-1-1",
             title: "Deleted Project Chat",
             owningBinding: {
               kind: "project",
-              workspaceId: "ws-gone",
+              workspaceId: "ws-1",
               workspaceRoot: canonicalGone,
               workspaceDisplayName: "deleted-ws",
             },
@@ -111,8 +123,20 @@ describe("DesktopStateStore (durable workspace & chat persistence)", () => {
       // Chat history itself is preserved so user never loses saved transcripts
       expect(reloaded!.chats).toHaveLength(1);
 
+      // Opening a new folder after restart MUST NOT reuse ws-1 held by the retained chat!
+      const nextId = allocateWorkspaceId(reloaded!.workspaces, reloaded!.chats);
+      expect(nextId).toBe("ws-2");
+
+      // Even if a workspace descriptor somehow carried ws-1 with a different root, it must NOT match the old chat
+      const mismatchedReuse = findMatchingProjectChat(reloaded!.chats, {
+        workspaceId: "ws-1",
+        workspaceRoot: canonicalNew,
+        displayName: "new-ws",
+      });
+      expect(mismatchedReuse).toBeUndefined();
+
       const res = resolveMessageFileLink({
-        chatId: "chat-gone",
+        chatId: "chat-ws-1-1",
         messageId: "m1",
         isRestoredMessage: true,
         owningBinding: reloaded!.chats[0]!.owningBinding,
@@ -129,6 +153,119 @@ describe("DesktopStateStore (durable workspace & chat persistence)", () => {
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
+  });
+
+  it("retains drive-root / filesystem-root workspaces and normalizes already-saved empty names on load", () => {
+    expect(deriveWorkspaceDisplayName("D:\\")).toBe("D:/");
+    expect(deriveWorkspaceDisplayName("c:/")).toBe("C:/");
+    expect(deriveWorkspaceDisplayName("/")).toBe("/");
+    expect(deriveWorkspaceDisplayName("C:\\Users\\dev\\my-repo")).toBe("my-repo");
+
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "omp-state-drive-root-"));
+    try {
+      const userDataDir = path.join(tmp, "user-data");
+      const rootDir = path.parse(tmp).root; // "C:\\" on Windows, "/" on POSIX
+      expect(path.basename(rootDir)).toBe("");
+
+      const store = new DesktopStateStore(userDataDir);
+      // Simulate legacy state saved with empty basename for a drive/filesystem root + an unavailable D:\ chat
+      store.save({
+        workspaces: [{ workspaceId: "ws-root", workspaceRoot: rootDir, displayName: "" }],
+        activeWorkspaceId: "ws-root",
+        activeChatId: "chat-root",
+        chats: [
+          {
+            chatId: "chat-root",
+            title: " Chat",
+            owningBinding: {
+              kind: "project",
+              workspaceId: "ws-root",
+              workspaceRoot: rootDir,
+              workspaceDisplayName: "",
+            },
+            messages: [{ messageId: "m-root", role: "user", text: "hi root", isRestoredMessage: false }],
+            composerDraft: "",
+          },
+          {
+            chatId: "chat-win-drive",
+            title: " Chat",
+            owningBinding: {
+              kind: "project",
+              workspaceId: "ws-d-drive",
+              workspaceRoot: "D:\\",
+              workspaceDisplayName: "",
+            },
+            messages: [{ messageId: "m-d", role: "user", text: "hi D:", isRestoredMessage: false }],
+            composerDraft: "",
+          },
+        ],
+      });
+
+      const reloaded = store.load();
+      expect(reloaded).not.toBeNull();
+      expect(reloaded!.workspaces).toHaveLength(1);
+      expect(reloaded!.workspaces[0]!.displayName).toBe(deriveWorkspaceDisplayName(rootDir));
+      expect(reloaded!.workspaces[0]!.displayName.length).toBeGreaterThan(0);
+
+      expect(reloaded!.chats).toHaveLength(2);
+      const rootChat = reloaded!.chats.find((c) => c.chatId === "chat-root")!;
+      expect(rootChat.owningBinding.kind).toBe("project");
+      if (rootChat.owningBinding.kind === "project") {
+        expect(rootChat.owningBinding.workspaceDisplayName).toBe(deriveWorkspaceDisplayName(rootDir));
+      }
+      expect(rootChat.title).toBe(`${deriveWorkspaceDisplayName(rootDir)} Chat`);
+
+      const winDriveChat = reloaded!.chats.find((c) => c.chatId === "chat-win-drive")!;
+      expect(winDriveChat.owningBinding.kind).toBe("project");
+      if (winDriveChat.owningBinding.kind === "project") {
+        expect(winDriveChat.owningBinding.workspaceDisplayName).toBe("D:/");
+      }
+      expect(winDriveChat.title).toBe("D:/ Chat");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("buildAskQuestionAnswer (OMP v19.1.1 parseAskDialogResponse contract)", () => {
+  it("makes single-choice write-ins mutually exclusive with preset options while allowing both for multi-select", () => {
+    expect(
+      buildAskQuestionAnswer({
+        id: "q-single-preset",
+        multi: false,
+        selectedOptions: ["Staging"],
+        customInput: "   ",
+      }),
+    ).toEqual({
+      id: "q-single-preset",
+      selectedOptions: ["Staging"],
+    });
+
+    expect(
+      buildAskQuestionAnswer({
+        id: "q-single-writein",
+        multi: false,
+        selectedOptions: ["Staging"],
+        customInput: "smoke-check",
+      }),
+    ).toEqual({
+      id: "q-single-writein",
+      selectedOptions: [],
+      customInput: "smoke-check",
+    });
+
+    expect(
+      buildAskQuestionAnswer({
+        id: "q-multi-both",
+        multi: true,
+        selectedOptions: ["Unit", "E2E"],
+        customInput: "nightly",
+      }),
+    ).toEqual({
+      id: "q-multi-both",
+      selectedOptions: ["Unit", "E2E"],
+      customInput: "nightly",
+    });
   });
 });
 

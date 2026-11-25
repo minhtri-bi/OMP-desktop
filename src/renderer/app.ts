@@ -1,5 +1,6 @@
 import type {
   ChatLinkItem,
+  ChatMessage,
   ChatThread,
   ChatWorkspaceBinding,
   DesktopBridgeApi,
@@ -10,8 +11,7 @@ import type {
   SourceFileContent,
   WorkspaceDescriptor,
 } from "../shared/contracts";
-import { parseReplyLinks } from "../shared/link-parser";
-import { extractAssistantText, extractStreamingUpdateText } from "../shared/omp-message";
+import { extractStreamingUpdateText } from "../shared/omp-message";
 import {
   buildNoConfiguredModelCard,
   buildOmpDialogCard,
@@ -397,6 +397,12 @@ function renderChatDialogs(): void {
     }
     const card = buildOmpDialogCard(req, async (response) => {
       const res = await api.respondToDialog(chatIdSnapshot, response);
+      if (!res.ok) {
+        if (res.error) {
+          showError("OMP_DIALOG", res.error);
+        }
+        return false;
+      }
       const remaining = (pendingDialogsByChatId.get(chatIdSnapshot) ?? []).filter(
         (item) => item.id !== req.id,
       );
@@ -409,9 +415,7 @@ function renderChatDialogs(): void {
       if (activeChatId === chatIdSnapshot) {
         renderChatDialogs();
       }
-      if (!res.ok && res.error) {
-        showError("OMP_DIALOG", res.error);
-      }
+      return true;
     });
     card.dataset.dialogId = req.id;
     chatDialogsEl.append(card);
@@ -1198,17 +1202,12 @@ composerForm.addEventListener("submit", async (ev) => {
   }
   composerInput.value = "";
   chat.composerDraft = "";
-  chat.messages.push({
-    messageId: `user-${Date.now()}-${chat.messages.length}`,
-    role: "user",
-    text,
-    isRestoredMessage: false,
-  });
 
   turnActiveChats.add(chat.chatId);
   streamingTextByChatId.set(chat.chatId, "");
   clearError();
-  renderActiveChat();
+  syncStreamingCardInTranscript();
+  syncComposerStreamingControls();
 
   const submittedChatId = chat.chatId;
   const res = await api.sendPrompt(submittedChatId, text);
@@ -1226,6 +1225,14 @@ composerForm.addEventListener("submit", async (ev) => {
         showError("OMP_RUNTIME", res.error);
       }
     }
+  } else if (res.agentInvoked === false) {
+    // Local commands (e.g. /session info) complete on the prompt ack without a later prompt_result.
+    turnActiveChats.delete(submittedChatId);
+    streamingTextByChatId.delete(submittedChatId);
+    if (activeChatId === submittedChatId) {
+      syncStreamingCardInTranscript();
+      syncComposerStreamingControls();
+    }
   }
 });
 
@@ -1239,12 +1246,24 @@ window.addEventListener("resize", () => {
 
 const runtimeBadgeEl = document.getElementById("runtime-badge");
 
+function handleIncomingChatMessage(payload: { chatId: string; message: ChatMessage }): void {
+  const targetChat = chats.find((c) => c.chatId === payload.chatId);
+  if (!targetChat) {
+    return;
+  }
+  if (!targetChat.messages.some((m) => m.messageId === payload.message.messageId)) {
+    targetChat.messages.push(payload.message);
+  }
+  if (payload.chatId === activeChatId) {
+    renderActiveChat();
+  }
+}
+
 function handleIncomingOmpEvent(payload: {
   chatId: string;
   event: import("../shared/contracts").OmpAdapterEvent;
 }): void {
   const { chatId, event } = payload;
-  const targetChat = chats.find((c) => c.chatId === chatId);
 
   if (event.type === "ready") {
     unconfiguredModelChatIds.delete(chatId);
@@ -1285,58 +1304,17 @@ function handleIncomingOmpEvent(payload: {
     return;
   }
 
-  if (event.type === "message_end" && targetChat) {
+  if (event.type === "message_end") {
     streamingTextByChatId.delete(chatId);
-    const extracted = extractAssistantText(event.message);
-    if (extracted) {
-      const messageId = `omp-${Date.now()}-${targetChat.messages.length}`;
-      const parsedLinks = parseReplyLinks(extracted.text, messageId);
-      targetChat.messages.push({
-        messageId,
-        role: extracted.role,
-        text: extracted.text,
-        links: parsedLinks.length > 0 ? parsedLinks : undefined,
-        isRestoredMessage: false,
-      });
-    }
     if (chatId === activeChatId) {
-      renderActiveChat();
+      syncStreamingCardInTranscript();
     }
     return;
   }
 
   if (event.type === "prompt_result") {
-    const partial = streamingTextByChatId.get(chatId);
     streamingTextByChatId.delete(chatId);
     turnActiveChats.delete(chatId);
-
-    if (event.status === "aborted" && targetChat) {
-      const trimmedPartial = partial?.trim() ?? "";
-      if (trimmedPartial.length > 0) {
-        const messageId = `omp-aborted-${Date.now()}-${targetChat.messages.length}`;
-        const combined = `${trimmedPartial}\n\n[Turn aborted]`;
-        const parsedLinks = parseReplyLinks(trimmedPartial, messageId);
-        targetChat.messages.push({
-          messageId,
-          role: "assistant",
-          text: combined,
-          links: parsedLinks.length > 0 ? parsedLinks : undefined,
-          isRestoredMessage: false,
-        });
-      } else {
-        targetChat.messages.push({
-          messageId: `sys-aborted-${Date.now()}-${targetChat.messages.length}`,
-          role: "system",
-          text: "Turn aborted.",
-          isRestoredMessage: false,
-        });
-      }
-      if (chatId === activeChatId) {
-        renderActiveChat();
-      }
-      return;
-    }
-
     if (chatId === activeChatId) {
       syncStreamingCardInTranscript();
       syncComposerStreamingControls();
@@ -1438,6 +1416,9 @@ function handleIncomingOmpEvent(payload: {
 }
 
 async function boot(): Promise<void> {
+  api.onChatMessage((payload) => {
+    handleIncomingChatMessage(payload);
+  });
   api.onOmpEvent((payload) => {
     handleIncomingOmpEvent(payload);
   });

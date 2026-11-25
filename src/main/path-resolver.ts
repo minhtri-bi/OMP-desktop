@@ -57,6 +57,27 @@ export function normalizeForComparison(
 }
 
 /**
+ * Derives a guaranteed non-empty workspace display name.
+ * Falls back to the canonical normalized root (e.g. "D:/" or "/") when `path.basename` is empty for drive/filesystem roots.
+ */
+export function deriveWorkspaceDisplayName(rootPath: string): string {
+  const trimmed = stripWin32ExtendedPrefix(rootPath).trim();
+  if (!trimmed) {
+    return "/";
+  }
+  if (/^[a-zA-Z]:[\\/]?$/.test(trimmed)) {
+    return normalizePathSlashes(trimmed);
+  }
+  const base = /^[a-zA-Z]:[\\/]/.test(trimmed)
+    ? path.win32.basename(trimmed)
+    : path.basename(trimmed);
+  if (base && base !== "/" && base !== "\\") {
+    return base;
+  }
+  return normalizePathSlashes(trimmed);
+}
+
+/**
  * Verifies containment using exact case on canonicalized paths by default so
  * case-sensitive filesystems (Linux, or NTFS per-directory case-sensitive dirs)
  * cannot be bypassed by case-folding. Pass `caseInsensitive: true` only for

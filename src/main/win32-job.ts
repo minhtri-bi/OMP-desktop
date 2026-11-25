@@ -4,6 +4,19 @@ const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9;
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
 const PROCESS_TERMINATE = 0x0001;
 const PROCESS_SET_QUOTA = 0x0100;
+const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+const STILL_ACTIVE = 259;
+const ERROR_INVALID_PARAMETER = 87;
+
+export type Win32JobAssignResult =
+  | { ok: true }
+  | { ok: false; reason: string; processAlreadyExited: boolean };
+
+export interface JobObjectSupervisor {
+  isAssigned(): boolean;
+  assignProcess(pid: number): Win32JobAssignResult;
+  terminateAndClose(exitCode?: number): void;
+}
 
 interface Kernel32Bindings {
   CreateJobObjectW: (lpJobAttributes: null, lpName: null) => unknown;
@@ -15,6 +28,8 @@ interface Kernel32Bindings {
   ) => boolean;
   OpenProcess: (dwDesiredAccess: number, bInheritHandle: boolean, dwProcessId: number) => unknown;
   AssignProcessToJobObject: (hJob: unknown, hProcess: unknown) => boolean;
+  GetExitCodeProcess: (hProcess: unknown, lpExitCode: number[]) => boolean;
+  GetLastError: () => number;
   TerminateJobObject: (hJob: unknown, uExitCode: number) => boolean;
   CloseHandle: (hObject: unknown) => boolean;
   extendedLimitSize: number;
@@ -73,6 +88,11 @@ function getKernel32(): Kernel32Bindings | null {
       AssignProcessToJobObject: lib.func(
         "bool __stdcall AssignProcessToJobObject(void *hJob, void *hProcess)",
       ) as Kernel32Bindings["AssignProcessToJobObject"],
+      GetExitCodeProcess: lib.func("__stdcall", "GetExitCodeProcess", "bool", [
+        "void *",
+        koffi.out(koffi.pointer("uint32")),
+      ]) as Kernel32Bindings["GetExitCodeProcess"],
+      GetLastError: lib.func("uint32 __stdcall GetLastError()") as Kernel32Bindings["GetLastError"],
       TerminateJobObject: lib.func(
         "bool __stdcall TerminateJobObject(void *hJob, uint32 uExitCode)",
       ) as Kernel32Bindings["TerminateJobObject"],
@@ -86,12 +106,21 @@ function getKernel32(): Kernel32Bindings | null {
   }
 }
 
+function isPidMissing(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ESRCH";
+  }
+}
+
 /**
  * Supervises a spawned Windows child process via a Win32 Job Object configured with
  * `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` so both `omp.exe` and any descendant tool processes
  * are guaranteed to terminate if the desktop host crashes or disposes the adapter.
  */
-export class Win32JobObject {
+export class Win32JobObject implements JobObjectSupervisor {
   private jobHandle: unknown = null;
   private assigned = false;
 
@@ -99,19 +128,39 @@ export class Win32JobObject {
     return this.assigned && this.jobHandle !== null;
   }
 
-  assignProcess(pid: number): boolean {
-    if (process.platform !== "win32" || !Number.isInteger(pid) || pid <= 0) {
-      return false;
+  assignProcess(pid: number): Win32JobAssignResult {
+    if (process.platform !== "win32") {
+      return {
+        ok: false,
+        reason: "Win32 Job Object supervision is only available on Windows.",
+        processAlreadyExited: false,
+      };
+    }
+    if (!Number.isInteger(pid) || pid <= 0) {
+      return {
+        ok: false,
+        reason: `Invalid process ID (${pid}).`,
+        processAlreadyExited: false,
+      };
     }
     const k32 = getKernel32();
     if (!k32) {
-      return false;
+      return {
+        ok: false,
+        reason: "Failed to initialize kernel32.dll Job Object bindings.",
+        processAlreadyExited: false,
+      };
     }
 
     if (!this.jobHandle) {
       const hJob = k32.CreateJobObjectW(null, null);
       if (!hJob) {
-        return false;
+        const lastErr = k32.GetLastError();
+        return {
+          ok: false,
+          reason: `CreateJobObjectW failed (Win32 error ${lastErr}).`,
+          processAlreadyExited: false,
+        };
       }
 
       const info = {
@@ -147,26 +196,49 @@ export class Win32JobObject {
         k32.extendedLimitSize,
       );
       if (!configured) {
+        const lastErr = k32.GetLastError();
         k32.CloseHandle(hJob);
-        return false;
+        return {
+          ok: false,
+          reason: `SetInformationJobObject failed (Win32 error ${lastErr}).`,
+          processAlreadyExited: false,
+        };
       }
       this.jobHandle = hJob;
     }
 
-    const hProcess = k32.OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid);
+    const hProcess = k32.OpenProcess(
+      PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+      false,
+      pid,
+    );
     if (!hProcess) {
+      const lastErr = k32.GetLastError();
+      const exited = lastErr === ERROR_INVALID_PARAMETER || isPidMissing(pid);
       this.terminateAndClose();
-      return false;
+      return {
+        ok: false,
+        reason: `OpenProcess failed for pid ${pid} (Win32 error ${lastErr}).`,
+        processAlreadyExited: exited,
+      };
     }
 
     try {
       const ok = k32.AssignProcessToJobObject(this.jobHandle, hProcess);
       if (!ok) {
+        const lastErr = k32.GetLastError();
+        const exitCodeOut = [0];
+        const gotExitCode = k32.GetExitCodeProcess(hProcess, exitCodeOut);
+        const exited = (gotExitCode && exitCodeOut[0] !== STILL_ACTIVE) || isPidMissing(pid);
         this.terminateAndClose();
-        return false;
+        return {
+          ok: false,
+          reason: `AssignProcessToJobObject failed for pid ${pid} (Win32 error ${lastErr}).`,
+          processAlreadyExited: exited,
+        };
       }
       this.assigned = true;
-      return true;
+      return { ok: true };
     } finally {
       k32.CloseHandle(hProcess);
     }
@@ -177,6 +249,7 @@ export class Win32JobObject {
    */
   terminateAndClose(exitCode = 1): void {
     const handle = this.jobHandle;
+    const wasAssigned = this.assigned;
     this.jobHandle = null;
     this.assigned = false;
     if (!handle) {
@@ -187,7 +260,9 @@ export class Win32JobObject {
       return;
     }
     try {
-      k32.TerminateJobObject(handle, exitCode);
+      if (wasAssigned) {
+        k32.TerminateJobObject(handle, exitCode);
+      }
     } finally {
       k32.CloseHandle(handle);
     }

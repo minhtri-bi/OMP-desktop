@@ -75,13 +75,15 @@ function Invoke-OmpRpcProbe {
         [Parameter(Mandatory)][string]$ResolvedOmpPath,
         [Parameter(Mandatory)][ValidateSet('rpc', 'rpc-ui')][string]$Mode,
         [Parameter(Mandatory)][int]$TimeoutSeconds,
-        [switch]$IncludeRecoveryChecks
+        [switch]$IncludeRecoveryChecks,
+        [switch]$UseSessionDirContinue
     )
 
     $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('omp-rpc-probe-' + [System.Guid]::NewGuid().ToString('N'))
     $probeCwd = Join-Path $tempRoot 'cwd'
     $probeAgentDir = Join-Path $tempRoot 'agent'
-    New-Item -ItemType Directory -Path $probeCwd, $probeAgentDir -Force | Out-Null
+    $probeSessionDir = Join-Path $tempRoot 'session'
+    New-Item -ItemType Directory -Path $probeCwd, $probeAgentDir, $probeSessionDir -Force | Out-Null
 
     # OMP v19.1.1 requires a selectable model to enter non-interactive RPC mode.
     # Use an isolated offline dummy provider (auth: none, unreachable loopback port 1); no prompt is ever sent.
@@ -110,9 +112,15 @@ providers:
         (New-Object System.Text.UTF8Encoding($false))
     )
 
+    $sessionArgs = if ($UseSessionDirContinue) {
+        "--session-dir `"$probeSessionDir`" --continue"
+    } else {
+        '--no-session'
+    }
+
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $ResolvedOmpPath
-    $psi.Arguments = "--mode $Mode --no-session --approval-mode always-ask --model offline-probe/offline-probe-model"
+    $psi.Arguments = "--mode $Mode $sessionArgs --approval-mode always-ask --model offline-probe/offline-probe-model"
     $psi.WorkingDirectory = $probeCwd
     $psi.UseShellExecute = $false
     $psi.RedirectStandardInput = $true
@@ -286,3 +294,4 @@ if ($LASTEXITCODE -ne 0) {
 Test-UnconfiguredRpcFailsFast -ResolvedOmpPath $resolvedOmp -TimeoutSeconds $TimeoutSeconds
 Invoke-OmpRpcProbe -ResolvedOmpPath $resolvedOmp -Mode 'rpc' -TimeoutSeconds $TimeoutSeconds -IncludeRecoveryChecks
 Invoke-OmpRpcProbe -ResolvedOmpPath $resolvedOmp -Mode 'rpc-ui' -TimeoutSeconds $TimeoutSeconds
+Invoke-OmpRpcProbe -ResolvedOmpPath $resolvedOmp -Mode 'rpc-ui' -TimeoutSeconds $TimeoutSeconds -UseSessionDirContinue

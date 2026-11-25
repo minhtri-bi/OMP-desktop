@@ -123,9 +123,36 @@ export function buildOpenUrlCard(
   return card;
 }
 
+export function buildAskQuestionAnswer(params: {
+  id: string;
+  multi: boolean;
+  selectedOptions: string[];
+  customInput: string;
+}): { id: string; selectedOptions: string[]; customInput?: string } {
+  const trimmedCustom = params.customInput.trim();
+  if (!params.multi) {
+    if (trimmedCustom) {
+      return {
+        id: params.id,
+        selectedOptions: [],
+        customInput: trimmedCustom,
+      };
+    }
+    return {
+      id: params.id,
+      selectedOptions: params.selectedOptions.slice(0, 1),
+    };
+  }
+  return {
+    id: params.id,
+    selectedOptions: params.selectedOptions,
+    ...(trimmedCustom ? { customInput: trimmedCustom } : {}),
+  };
+}
+
 export function buildOmpDialogCard(
   request: OmpDialogRequest,
-  onRespond: (response: OmpDialogResponse) => Promise<void>,
+  onRespond: (response: OmpDialogResponse) => Promise<boolean>,
 ): HTMLElement {
   const card = document.createElement("section");
   card.className = "dialog-card";
@@ -134,10 +161,31 @@ export function buildOmpDialogCard(
   card.setAttribute("role", "group");
 
   const controlsToDisable: Array<HTMLButtonElement | HTMLInputElement | HTMLTextAreaElement> = [];
-  const lockControls = (): void => {
+  const lockControls = (): Map<
+    HTMLButtonElement | HTMLInputElement | HTMLTextAreaElement,
+    boolean
+  > => {
+    const prior = new Map<HTMLButtonElement | HTMLInputElement | HTMLTextAreaElement, boolean>();
     for (const el of controlsToDisable) {
+      prior.set(el, el.disabled);
       el.disabled = true;
     }
+    return prior;
+  };
+  const unlockControls = (
+    prior: Map<HTMLButtonElement | HTMLInputElement | HTMLTextAreaElement, boolean>,
+  ): void => {
+    for (const [el, wasDisabled] of prior.entries()) {
+      el.disabled = wasDisabled;
+    }
+  };
+  const dispatchResponse = async (response: OmpDialogResponse): Promise<boolean> => {
+    const prior = lockControls();
+    const ok = await onRespond(response);
+    if (!ok) {
+      unlockControls(prior);
+    }
+    return ok;
   };
 
   const header = document.createElement("div");
@@ -204,16 +252,13 @@ export function buildOmpDialogCard(
     controlsToDisable.push(approveBtn, denyBtn, cancelBtn);
 
     approveBtn.addEventListener("click", async () => {
-      lockControls();
-      await onRespond({ id: request.id, kind: "confirm", confirmed: true });
+      await dispatchResponse({ id: request.id, kind: "confirm", confirmed: true });
     });
     denyBtn.addEventListener("click", async () => {
-      lockControls();
-      await onRespond({ id: request.id, kind: "confirm", confirmed: false });
+      await dispatchResponse({ id: request.id, kind: "confirm", confirmed: false });
     });
     cancelBtn.addEventListener("click", async () => {
-      lockControls();
-      await onRespond({ id: request.id, kind: "cancel" });
+      await dispatchResponse({ id: request.id, kind: "cancel" });
     });
 
     actions.append(approveBtn, denyBtn, cancelBtn);
@@ -303,14 +348,12 @@ export function buildOmpDialogCard(
       if (!isMulti && selected.length === 0) {
         return;
       }
-      lockControls();
       const value = isMulti ? selected.join("\n") : (selected[0] ?? "");
-      await onRespond({ id: request.id, kind: "value", value });
+      await dispatchResponse({ id: request.id, kind: "value", value });
     });
 
     cancelBtn.addEventListener("click", async () => {
-      lockControls();
-      await onRespond({ id: request.id, kind: "cancel" });
+      await dispatchResponse({ id: request.id, kind: "cancel" });
     });
 
     actions.append(submitBtn, cancelBtn);
@@ -370,11 +413,10 @@ export function buildOmpDialogCard(
 
     const submitValue = async (): Promise<void> => {
       const val = field.value;
-      lockControls();
       if (isSecret) {
         field.value = "";
       }
-      await onRespond({ id: request.id, kind: "value", value: val });
+      await dispatchResponse({ id: request.id, kind: "value", value: val });
     };
 
     if (field instanceof HTMLInputElement) {
@@ -391,11 +433,10 @@ export function buildOmpDialogCard(
     });
 
     cancelBtn.addEventListener("click", async () => {
-      lockControls();
       if (isSecret) {
         field.value = "";
       }
-      await onRespond({ id: request.id, kind: "cancel" });
+      await dispatchResponse({ id: request.id, kind: "cancel" });
     });
 
     actions.append(submitBtn, cancelBtn);
@@ -437,6 +478,15 @@ export function buildOmpDialogCard(
           ? q.recommended
           : 0;
 
+      const customInput = document.createElement("input");
+      customInput.type = "text";
+      customInput.className = "dialog-input dialog-custom-input";
+      customInput.placeholder = isMulti
+        ? "Optional additional write-in response..."
+        : "Write a custom response (replaces preset choice)...";
+      customInput.dataset.testid = `dialog-ask-custom-${q.id}`;
+      controlsToDisable.push(customInput);
+
       q.options.forEach((opt, idx) => {
         const row = document.createElement("label");
         row.className = "dialog-option-row";
@@ -447,6 +497,14 @@ export function buildOmpDialogCard(
         input.value = opt.label;
         input.dataset.testid = `dialog-ask-opt-${q.id}-${idx}`;
         input.checked = !isMulti && q.options.length > 0 && idx === defaultIdx;
+
+        if (!isMulti) {
+          input.addEventListener("change", () => {
+            if (input.checked) {
+              customInput.value = "";
+            }
+          });
+        }
 
         optionInputs.push(input);
         controlsToDisable.push(input);
@@ -471,24 +529,52 @@ export function buildOmpDialogCard(
         qOptions.append(row);
       });
 
-      qBlock.append(qOptions);
+      if (!isMulti) {
+        // Pinned OMP parseAskDialogResponse forbids combining a preset choice with a write-in
+        // for single-choice questions, so represent write-in as an explicit mutually exclusive Other radio.
+        const otherRow = document.createElement("label");
+        otherRow.className = "dialog-option-row";
 
-      const customInput = document.createElement("input");
-      customInput.type = "text";
-      customInput.className = "dialog-input dialog-custom-input";
-      customInput.placeholder = "Optional write-in response...";
-      customInput.dataset.testid = `dialog-ask-custom-${q.id}`;
-      controlsToDisable.push(customInput);
-      qBlock.append(customInput);
+        const otherRadio = document.createElement("input");
+        otherRadio.type = "radio";
+        otherRadio.name = `omp-ask-${request.id}-${q.id}`;
+        otherRadio.value = "__other__";
+        otherRadio.dataset.testid = `dialog-ask-other-${q.id}`;
+        otherRadio.checked = q.options.length === 0;
+        controlsToDisable.push(otherRadio);
+
+        otherRadio.addEventListener("change", () => {
+          if (otherRadio.checked) {
+            customInput.focus();
+          }
+        });
+        customInput.addEventListener("input", () => {
+          if (customInput.value.trim().length > 0) {
+            otherRadio.checked = true;
+          }
+        });
+
+        const otherTextWrap = document.createElement("div");
+        otherTextWrap.className = "dialog-option-text";
+        const otherLabel = document.createElement("span");
+        otherLabel.className = "dialog-option-label";
+        otherLabel.textContent = "Other (write-in)";
+        otherTextWrap.append(otherLabel);
+
+        otherRow.append(otherRadio, otherTextWrap);
+        qOptions.append(otherRow);
+      }
+
+      qBlock.append(qOptions, customInput);
 
       questionCollectors.push(() => {
         const selectedOptions = optionInputs.filter((i) => i.checked).map((i) => i.value);
-        const trimmedCustom = customInput.value.trim();
-        return {
+        return buildAskQuestionAnswer({
           id: q.id,
+          multi: isMulti,
           selectedOptions,
-          ...(trimmedCustom ? { customInput: trimmedCustom } : {}),
-        };
+          customInput: customInput.value,
+        });
       });
 
       card.append(qBlock);
@@ -512,14 +598,12 @@ export function buildOmpDialogCard(
     controlsToDisable.push(submitBtn, cancelBtn);
 
     submitBtn.addEventListener("click", async () => {
-      lockControls();
       const answers = questionCollectors.map((fn) => fn());
-      await onRespond({ id: request.id, kind: "ask", answers });
+      await dispatchResponse({ id: request.id, kind: "ask", answers });
     });
 
     cancelBtn.addEventListener("click", async () => {
-      lockControls();
-      await onRespond({ id: request.id, kind: "cancel" });
+      await dispatchResponse({ id: request.id, kind: "cancel" });
     });
 
     actions.append(submitBtn, cancelBtn);
@@ -535,9 +619,9 @@ export function buildOmpDialogCard(
   cancelBtn.className = "btn btn-subtle";
   cancelBtn.dataset.testid = "dialog-cancel-btn";
   cancelBtn.textContent = "Cancel";
+  controlsToDisable.push(cancelBtn);
   cancelBtn.addEventListener("click", async () => {
-    cancelBtn.disabled = true;
-    await onRespond({ id: request.id, kind: "cancel" });
+    await dispatchResponse({ id: request.id, kind: "cancel" });
   });
   actions.append(cancelBtn);
   card.append(actions);
