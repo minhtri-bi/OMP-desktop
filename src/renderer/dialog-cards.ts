@@ -153,6 +153,7 @@ export function buildAskQuestionAnswer(params: {
 export function buildOmpDialogCard(
   request: OmpDialogRequest,
   onRespond: (response: OmpDialogResponse) => Promise<boolean>,
+  scopeKey = "default",
 ): HTMLElement {
   const card = document.createElement("section");
   card.className = "dialog-card";
@@ -286,7 +287,7 @@ export function buildOmpDialogCard(
 
       const input = document.createElement("input");
       input.type = isMulti ? "checkbox" : "radio";
-      input.name = `omp-select-${request.id}`;
+      input.name = `omp-select-${scopeKey}-${request.id}`;
       input.value = optText;
       input.dataset.testid = `dialog-select-option-${idx}`;
       input.checked = isMulti ? initialChecked.has(idx) : idx === defaultRadioIdx;
@@ -495,7 +496,7 @@ export function buildOmpDialogCard(
 
         const input = document.createElement("input");
         input.type = isMulti ? "checkbox" : "radio";
-        input.name = `omp-ask-${request.id}-${q.id}`;
+        input.name = `omp-ask-${scopeKey}-${request.id}-${q.id}`;
         input.value = opt.label;
         input.dataset.testid = `dialog-ask-opt-${q.id}-${idx}`;
         input.checked = !isMulti && q.options.length > 0 && idx === defaultIdx;
@@ -541,7 +542,7 @@ export function buildOmpDialogCard(
 
         const otherRadio = document.createElement("input");
         otherRadio.type = "radio";
-        otherRadio.name = `omp-ask-${request.id}-${q.id}`;
+        otherRadio.name = `omp-ask-${scopeKey}-${request.id}-${q.id}`;
         otherRadio.value = "__other__";
         otherRadio.dataset.testid = `dialog-ask-other-${q.id}`;
         otherRadio.checked = q.options.length === 0;

@@ -123,21 +123,26 @@ describe("DesktopStateStore (durable workspace & chat persistence)", () => {
       // Chat history itself is preserved so user never loses saved transcripts
       expect(reloaded!.chats).toHaveLength(1);
 
-      // Opening a DIFFERENT folder after restart MUST NOT reuse ws-1 held by the retained chat!
-      const nextId = allocateWorkspaceId(reloaded!.workspaces, reloaded!.chats, undefined, canonicalNew);
+      // Use real Map.values() one-shot iterators (mirroring main.ts) to prove opening an unrelated
+      // folder reserves ws-1 and reopening the original folder recovers ws-1 cleanly.
+      const wsMap = new Map(reloaded!.workspaces.map((w) => [w.workspaceId, w]));
+      const chatMap = new Map(reloaded!.chats.map((c) => [c.chatId, c]));
+
+      const nextId = allocateWorkspaceId(wsMap.values(), chatMap.values(), undefined, canonicalNew);
       expect(nextId).toBe("ws-2");
+      wsMap.set(nextId, { workspaceId: nextId, workspaceRoot: canonicalNew, displayName: "new-ws" });
 
       // Reopening the SAME folder after it comes back online MUST recover ws-1 and reconnect its retained chat!
       fs.mkdirSync(wsGone, { recursive: true });
       const recoveredRoot = canonicalizeExistingPath(wsGone);
       const recoveredId = allocateWorkspaceId(
-        reloaded!.workspaces,
-        reloaded!.chats,
+        wsMap.values(),
+        chatMap.values(),
         undefined,
         recoveredRoot,
       );
       expect(recoveredId).toBe("ws-1");
-      const reconnectedChat = findMatchingProjectChat(reloaded!.chats, {
+      const reconnectedChat = findMatchingProjectChat(chatMap.values(), {
         workspaceId: recoveredId,
         workspaceRoot: recoveredRoot,
         displayName: "deleted-ws",

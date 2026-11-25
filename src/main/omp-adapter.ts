@@ -304,22 +304,6 @@ export class OmpRuntimeAdapter {
       fs.mkdirSync(path.join(cwd, ".git"), { recursive: true });
     }
 
-    // Create and configure the Win32 Job Object BEFORE spawning so a setup failure fails closed
-    // without ever launching an unsupervised omp.exe child process.
-    let preparedJob: JobObjectSupervisor | null = null;
-    if (this.requireJobObject) {
-      preparedJob = this.createJobObject();
-      if (preparedJob.prepare) {
-        const prep = preparedJob.prepare();
-        if (!prep.ok) {
-          preparedJob.terminateAndClose(1);
-          const err = new Error(`Failed to prepare Windows Job Object for OMP: ${prep.reason}`);
-          this.failStartupOrPending(err, "PROCESS_EXITED");
-          throw err;
-        }
-      }
-    }
-
     const args = [
       ...(config.ompArgsPrefix ?? []),
       "--mode",
@@ -349,12 +333,34 @@ export class OmpRuntimeAdapter {
       delete env.PI_PROFILE;
     }
 
-    const child = spawn(config.ompExecutablePath, args, {
-      cwd,
-      env,
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
-    });
+    // Create and configure the Win32 Job Object AFTER filesystem/arg setup and BEFORE spawning
+    // so setup errors never leak native handles and Job Object failures never spawn an unsupervised child.
+    let preparedJob: JobObjectSupervisor | null = null;
+    if (this.requireJobObject) {
+      preparedJob = this.createJobObject();
+      if (preparedJob.prepare) {
+        const prep = preparedJob.prepare();
+        if (!prep.ok) {
+          preparedJob.terminateAndClose(1);
+          const err = new Error(`Failed to prepare Windows Job Object for OMP: ${prep.reason}`);
+          this.failStartupOrPending(err, "PROCESS_EXITED");
+          throw err;
+        }
+      }
+    }
+
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      child = spawn(config.ompExecutablePath, args, {
+        cwd,
+        env,
+        stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true,
+      });
+    } catch (spawnErr) {
+      preparedJob?.terminateAndClose(1);
+      throw spawnErr;
+    }
     this.child = child;
 
     // Assign immediately on the very next synchronous statement after spawn() to minimize

@@ -405,26 +405,30 @@ function reconcileChatDialogContainer(chatId: string): HTMLElement | null {
     if (alreadyMounted) {
       continue;
     }
-    const card = buildOmpDialogCard(req, async (response) => {
-      const res = await api.respondToDialog(chatId, response);
-      if (!res.ok) {
-        if (res.error) {
-          showError("OMP_DIALOG", res.error);
+    const card = buildOmpDialogCard(
+      req,
+      async (response) => {
+        const res = await api.respondToDialog(chatId, response);
+        if (!res.ok) {
+          if (res.error) {
+            showError("OMP_DIALOG", res.error);
+          }
+          return false;
         }
-        return false;
-      }
-      const remaining = (pendingDialogsByChatId.get(chatId) ?? []).filter(
-        (item) => item.id !== req.id,
-      );
-      if (remaining.length > 0) {
-        pendingDialogsByChatId.set(chatId, remaining);
-      } else {
-        pendingDialogsByChatId.delete(chatId);
-      }
-      renderChatList();
-      renderChatDialogs();
-      return true;
-    });
+        const remaining = (pendingDialogsByChatId.get(chatId) ?? []).filter(
+          (item) => item.id !== req.id,
+        );
+        if (remaining.length > 0) {
+          pendingDialogsByChatId.set(chatId, remaining);
+        } else {
+          pendingDialogsByChatId.delete(chatId);
+        }
+        renderChatList();
+        renderChatDialogs();
+        return true;
+      },
+      chatId,
+    );
     card.dataset.dialogId = req.id;
     container.append(card);
   }

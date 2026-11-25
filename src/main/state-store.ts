@@ -45,23 +45,26 @@ export function allocateWorkspaceId(
   for (const ws of workspaces) {
     activeWsIds.add(ws.workspaceId);
   }
-  if (canonicalRoot) {
-    const targetRoot = normalizeForComparison(canonicalRoot);
-    for (const chat of chats) {
-      if (
-        chat.owningBinding.kind === "project" &&
-        !activeWsIds.has(chat.owningBinding.workspaceId) &&
-        normalizeForComparison(chat.owningBinding.workspaceRoot) === targetRoot
-      ) {
-        return chat.owningBinding.workspaceId;
-      }
-    }
-  }
+  // Scan `chats` in a single pass so one-shot iterators like `Map.values()` are never exhausted
+  // before offline workspace IDs are added to `reserved`.
   const reserved = new Set<string>(activeWsIds);
+  const targetRoot = canonicalRoot ? normalizeForComparison(canonicalRoot) : null;
+  let recoveredId: string | null = null;
   for (const chat of chats) {
     if (chat.owningBinding.kind === "project") {
       reserved.add(chat.owningBinding.workspaceId);
+      if (
+        recoveredId === null &&
+        targetRoot !== null &&
+        !activeWsIds.has(chat.owningBinding.workspaceId) &&
+        normalizeForComparison(chat.owningBinding.workspaceRoot) === targetRoot
+      ) {
+        recoveredId = chat.owningBinding.workspaceId;
+      }
     }
+  }
+  if (recoveredId !== null) {
+    return recoveredId;
   }
   let seq = 1;
   let candidate = `ws-${seq}`;
@@ -308,21 +311,23 @@ function sanitizeChat(raw: unknown): ChatThread | null {
 
 export class DesktopStateStore {
   private readonly filePath: string;
+  private readonly backupPath: string;
 
   constructor(userDataDir: string) {
     this.filePath = path.join(userDataDir, "desktop-state.json");
+    this.backupPath = path.join(userDataDir, "desktop-state.json.bak");
   }
 
   getFilePath(): string {
     return this.filePath;
   }
 
-  load(): PersistedDesktopState | null {
-    if (!fs.existsSync(this.filePath)) {
+  private tryLoadFromPath(targetPath: string): PersistedDesktopState | null {
+    if (!fs.existsSync(targetPath)) {
       return null;
     }
     try {
-      const rawText = fs.readFileSync(this.filePath, "utf8");
+      const rawText = fs.readFileSync(targetPath, "utf8");
       const parsed = JSON.parse(rawText) as unknown;
       if (!parsed || typeof parsed !== "object") {
         return null;
@@ -378,6 +383,10 @@ export class DesktopStateStore {
     }
   }
 
+  load(): PersistedDesktopState | null {
+    return this.tryLoadFromPath(this.filePath) ?? this.tryLoadFromPath(this.backupPath);
+  }
+
   save(state: Omit<PersistedDesktopState, "version">): void {
     const dir = path.dirname(this.filePath);
     fs.mkdirSync(dir, { recursive: true });
@@ -391,14 +400,31 @@ export class DesktopStateStore {
     const serialized = JSON.stringify(payload, null, 2);
     const tmpPath = `${this.filePath}.${process.pid}.${Date.now()}.tmp`;
     fs.writeFileSync(tmpPath, serialized, "utf8");
-    try {
-      fs.renameSync(tmpPath, this.filePath);
-    } catch {
-      fs.copyFileSync(tmpPath, this.filePath);
+
+    let renamed = false;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
-        fs.unlinkSync(tmpPath);
+        fs.renameSync(tmpPath, this.filePath);
+        renamed = true;
+        break;
       } catch {
-        // ignore best-effort temp cleanup
+        // Retry transient Windows AV/indexer locks before falling back
+      }
+    }
+
+    if (!renamed) {
+      try {
+        // Snapshot the last known-good state file into backupPath BEFORE overwriting live file
+        if (fs.existsSync(this.filePath)) {
+          fs.copyFileSync(this.filePath, this.backupPath);
+        }
+        fs.copyFileSync(tmpPath, this.filePath);
+      } finally {
+        try {
+          fs.unlinkSync(tmpPath);
+        } catch {
+          // ignore best-effort temp cleanup
+        }
       }
     }
   }

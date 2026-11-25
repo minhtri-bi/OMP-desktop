@@ -462,6 +462,7 @@ test("Stage 2: NO_CONFIGURED_MODEL onboarding, startup dialogs, local commands, 
     "utf8",
   );
 
+  const receivedPromptsFile = path.join(stage2Dir, "received-prompts.jsonl");
   const interactiveMockOmp = path.join(stage2Dir, "mock-omp-interactive.cjs");
   fs.writeFileSync(
     interactiveMockOmp,
@@ -470,6 +471,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const readline = require("node:readline");
 const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+const receivedPromptsFile = ${JSON.stringify(receivedPromptsFile)};
 
 const argv = process.argv.slice(2);
 const dirIdx = argv.indexOf("--session-dir");
@@ -563,6 +565,9 @@ function validateAskAnswers(answers) {
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   const msg = JSON.parse(line);
+  if (msg.type === "prompt") {
+    fs.appendFileSync(receivedPromptsFile, JSON.stringify(msg.message) + "\\n", "utf8");
+  }
   if (msg.type === "extension_ui_response" && msg.id === "startup-confirm-1") {
     startupApproved = msg.confirmed === true;
     if (queuedNegotiate) {
@@ -750,6 +755,15 @@ rl.on("close", () => process.exit(0));
       // Local command finishes with agentInvoked: false -> composer MUST unlock (no Stop lockout!)
       await expect(winLive.getByTestId("composer-abort-btn")).toBeHidden();
       await expect(winLive.getByTestId("composer-send-btn")).toBeEnabled();
+
+      // Confirm at the runtime layer that the startup-aborted prompt was NEVER dispatched to OMP
+      const dispatchedPrompts = fs
+        .readFileSync(receivedPromptsFile, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as string);
+      expect(dispatchedPrompts).not.toContain("cancelled-before-ready-prompt");
+      expect(dispatchedPrompts).toContain("/session info");
 
       // Now send a full streaming + approval + secret + ask prompt
       await winLive.getByTestId("composer-input").fill("test-approvals-and-stream");

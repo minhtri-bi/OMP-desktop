@@ -923,4 +923,42 @@ setInterval(() => {}, 10000);
       fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
+
+  it("completes sessionDir setup before preparing Job Object so filesystem errors never leak handles", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "omp-adapter-job-fs-"));
+    try {
+      // Create a regular file where sessionDir is expected so fs.mkdirSync(sessionDir) fails
+      const blockingFile = path.join(tmp, "not-a-dir");
+      fs.writeFileSync(blockingFile, "block", "utf8");
+
+      let prepareCalled = false;
+      const adapter = new OmpRuntimeAdapter({
+        requireJobObject: true,
+        createJobObject: () => ({
+          isAssigned: () => false,
+          prepare: () => {
+            prepareCalled = true;
+            return { ok: true };
+          },
+          assignProcess: () => ({ ok: true }),
+          terminateAndClose: () => {},
+        }),
+      });
+
+      await expect(
+        adapter.start({
+          ompExecutablePath: process.execPath,
+          scope: { kind: "standalone", standaloneCwd: path.join(tmp, "standalone") },
+          approvalMode: "always-ask",
+          sessionDir: path.join(blockingFile, "nested"),
+          requireProtocolV2: true,
+          shutdownTimeoutMs: 2_000,
+        }),
+      ).rejects.toThrow();
+
+      expect(prepareCalled).toBe(false);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
+  });
 });
