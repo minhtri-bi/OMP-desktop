@@ -853,6 +853,12 @@ body {
   background: #f5f3ed;
 }
 
+.chat-dialog-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
 .dialog-card {
   background: var(--bg-surface);
   border: 1px solid var(--border-strong);

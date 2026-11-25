@@ -25,21 +25,39 @@ export interface PersistedDesktopState {
 }
 
 /**
- * Allocates a workspace ID that does not collide with any active workspace OR any retained
- * project chat binding (including chats whose original workspace directory is temporarily unavailable).
+ * Allocates a workspace ID for `canonicalRoot`.
+ * - If a retained project chat already owns an unclaimed ID for the exact same canonical root
+ *   (e.g., a removable drive or moved folder returning after an offline restart), recover that ID
+ *   so reopening the folder reconnects its saved chat instead of creating a blank duplicate.
+ * - Otherwise, reserve IDs held by both active workspaces and all retained project chats so a
+ *   different folder can never inherit an unrelated retained chat.
  */
 export function allocateWorkspaceId(
   workspaces: Iterable<WorkspaceDescriptor>,
   chats: Iterable<ChatThread>,
   explicitId?: string,
+  canonicalRoot?: string,
 ): string {
   if (explicitId) {
     return explicitId;
   }
-  const reserved = new Set<string>();
+  const activeWsIds = new Set<string>();
   for (const ws of workspaces) {
-    reserved.add(ws.workspaceId);
+    activeWsIds.add(ws.workspaceId);
   }
+  if (canonicalRoot) {
+    const targetRoot = normalizeForComparison(canonicalRoot);
+    for (const chat of chats) {
+      if (
+        chat.owningBinding.kind === "project" &&
+        !activeWsIds.has(chat.owningBinding.workspaceId) &&
+        normalizeForComparison(chat.owningBinding.workspaceRoot) === targetRoot
+      ) {
+        return chat.owningBinding.workspaceId;
+      }
+    }
+  }
+  const reserved = new Set<string>(activeWsIds);
   for (const chat of chats) {
     if (chat.owningBinding.kind === "project") {
       reserved.add(chat.owningBinding.workspaceId);

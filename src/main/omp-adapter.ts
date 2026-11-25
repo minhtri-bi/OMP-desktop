@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import type {
@@ -252,15 +252,21 @@ export class OmpRuntimeAdapter {
     }
     if (process.platform === "win32" && typeof child.pid === "number") {
       try {
-        spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true });
+        // Run taskkill /T /F synchronously BEFORE child.kill so Windows can walk the full process tree
+        spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+          windowsHide: true,
+          timeout: 3_000,
+        });
       } catch {
         // fall through to child.kill
       }
     }
-    try {
-      child.kill("SIGKILL");
-    } catch {
-      // ignore already-exited child
+    if (child.exitCode === null) {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // ignore already-exited child
+      }
     }
   }
 
@@ -296,6 +302,22 @@ export class OmpRuntimeAdapter {
       // Place an empty .git sentinel inside standalone-cwd so OMP's ancestor AGENTS.md / repo-root
       // discovery halts at standalone-cwd and never walks up into %USERPROFILE%.
       fs.mkdirSync(path.join(cwd, ".git"), { recursive: true });
+    }
+
+    // Create and configure the Win32 Job Object BEFORE spawning so a setup failure fails closed
+    // without ever launching an unsupervised omp.exe child process.
+    let preparedJob: JobObjectSupervisor | null = null;
+    if (this.requireJobObject) {
+      preparedJob = this.createJobObject();
+      if (preparedJob.prepare) {
+        const prep = preparedJob.prepare();
+        if (!prep.ok) {
+          preparedJob.terminateAndClose(1);
+          const err = new Error(`Failed to prepare Windows Job Object for OMP: ${prep.reason}`);
+          this.failStartupOrPending(err, "PROCESS_EXITED");
+          throw err;
+        }
+      }
     }
 
     const args = [
@@ -334,6 +356,31 @@ export class OmpRuntimeAdapter {
       windowsHide: true,
     });
     this.child = child;
+
+    // Assign immediately on the very next synchronous statement after spawn() to minimize
+    // any window before Win32 Job Object supervision is active.
+    if (preparedJob) {
+      if (typeof child.pid === "number") {
+        const assignRes = preparedJob.assignProcess(child.pid);
+        if (assignRes.ok) {
+          this.jobObject = preparedJob;
+        } else {
+          preparedJob.terminateAndClose(1);
+          if (!assignRes.processAlreadyExited && child.exitCode === null) {
+            this.disposed = true;
+            this.terminateChildTree(child);
+            this.child = null;
+            const err = new Error(
+              `Failed to assign OMP process (pid=${child.pid}) to Windows Job Object: ${assignRes.reason}`,
+            );
+            this.failStartupOrPending(err, "PROCESS_EXITED");
+            throw err;
+          }
+        }
+      } else {
+        preparedJob.terminateAndClose(1);
+      }
+    }
 
     const readyPromise = new Promise<OmpReadyMetadata>((resolve, reject) => {
       this.readyResolve = resolve;
@@ -389,28 +436,6 @@ export class OmpRuntimeAdapter {
         this.failStartupOrPending(err, "PROCESS_EXITED", true);
       }
     });
-
-    if (this.requireJobObject && typeof child.pid === "number") {
-      const job = this.createJobObject();
-      const assignRes = job.assignProcess(child.pid);
-      if (assignRes.ok) {
-        this.jobObject = job;
-      } else if (!assignRes.processAlreadyExited && child.exitCode === null) {
-        // Fail closed: never leave an unsupervised OMP runtime alive on Windows where
-        // crashed turns could orphan tool subprocesses.
-        this.disposed = true;
-        this.terminateChildTree(child);
-        this.child = null;
-        const err = new Error(
-          `Failed to assign OMP process (pid=${child.pid}) to Windows Job Object: ${assignRes.reason}`,
-        );
-        readyPromise.catch(() => {
-          // prevent unhandled rejection since we throw err synchronously after failStartupOrPending
-        });
-        this.failStartupOrPending(err, "PROCESS_EXITED");
-        throw err;
-      }
-    }
 
     try {
       const initialMeta = await readyPromise;
@@ -943,7 +968,10 @@ export class OmpRuntimeAdapter {
             if (process.platform === "win32") {
               this.releaseJobObject(1);
               if (child.exitCode === null && child.pid) {
-                spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true });
+                spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+                  windowsHide: true,
+                  timeout: 3_000,
+                });
               }
             } else {
               child.kill("SIGKILL");

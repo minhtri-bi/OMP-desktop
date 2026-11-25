@@ -449,7 +449,7 @@ export function buildOmpDialogCard(
       id: string;
       selectedOptions: string[];
       customInput?: string;
-    }> = [];
+    } | null> = [];
 
     for (const q of request.questions) {
       const qBlock = document.createElement("div");
@@ -477,6 +477,8 @@ export function buildOmpDialogCard(
         typeof q.recommended === "number" && q.recommended >= 0 && q.recommended < q.options.length
           ? q.recommended
           : 0;
+      let lastPresetIdx = defaultIdx;
+      let otherRadioEl: HTMLInputElement | null = null;
 
       const customInput = document.createElement("input");
       customInput.type = "text";
@@ -501,7 +503,9 @@ export function buildOmpDialogCard(
         if (!isMulti) {
           input.addEventListener("change", () => {
             if (input.checked) {
+              lastPresetIdx = idx;
               customInput.value = "";
+              customInput.setCustomValidity("");
             }
           });
         }
@@ -541,16 +545,22 @@ export function buildOmpDialogCard(
         otherRadio.value = "__other__";
         otherRadio.dataset.testid = `dialog-ask-other-${q.id}`;
         otherRadio.checked = q.options.length === 0;
+        otherRadioEl = otherRadio;
         controlsToDisable.push(otherRadio);
 
         otherRadio.addEventListener("change", () => {
           if (otherRadio.checked) {
+            customInput.setCustomValidity("");
             customInput.focus();
           }
         });
         customInput.addEventListener("input", () => {
+          customInput.setCustomValidity("");
           if (customInput.value.trim().length > 0) {
             otherRadio.checked = true;
+          } else if (optionInputs.length > 0) {
+            // Clearing the write-in restores the last chosen preset so Submit never silently drops the answer.
+            optionInputs[lastPresetIdx]!.checked = true;
           }
         });
 
@@ -568,6 +578,12 @@ export function buildOmpDialogCard(
       qBlock.append(qOptions, customInput);
 
       questionCollectors.push(() => {
+        if (!isMulti && otherRadioEl?.checked && customInput.value.trim().length === 0) {
+          customInput.setCustomValidity("Enter a custom response or select an option above.");
+          customInput.reportValidity();
+          customInput.focus();
+          return null;
+        }
         const selectedOptions = optionInputs.filter((i) => i.checked).map((i) => i.value);
         return buildAskQuestionAnswer({
           id: q.id,
@@ -598,7 +614,14 @@ export function buildOmpDialogCard(
     controlsToDisable.push(submitBtn, cancelBtn);
 
     submitBtn.addEventListener("click", async () => {
-      const answers = questionCollectors.map((fn) => fn());
+      const answers: Array<{ id: string; selectedOptions: string[]; customInput?: string }> = [];
+      for (const collect of questionCollectors) {
+        const answer = collect();
+        if (!answer) {
+          return;
+        }
+        answers.push(answer);
+      }
       await dispatchResponse({ id: request.id, kind: "ask", answers });
     });
 

@@ -53,9 +53,17 @@ const MAX_PDF_BYTES = 50 * 1024 * 1024;
 let mainWindow: BrowserWindow | null = null;
 let previewManager: IsolatedPreviewManager | null = null;
 let stateStore: DesktopStateStore | null = null;
+interface ActivePromptAttempt {
+  token: number;
+  aborted: boolean;
+  dispatched: boolean;
+}
+
 const adaptersByChatId = new Map<string, OmpRuntimeAdapter>();
 const startingAdaptersByChatId = new Map<string, Promise<OmpRuntimeAdapter>>();
 const startingAdapterInstancesByChatId = new Map<string, OmpRuntimeAdapter>();
+const activePromptByChatId = new Map<string, ActivePromptAttempt>();
+let nextPromptToken = 0;
 
 const workspaces = new Map<string, WorkspaceDescriptor>();
 const chats = new Map<string, ChatThread>();
@@ -141,7 +149,12 @@ function addWorkspace(rootPath: string, explicitId?: string, explicitName?: stri
       return existing;
     }
   }
-  const workspaceId = allocateWorkspaceId(workspaces.values(), chats.values(), explicitId);
+  const workspaceId = allocateWorkspaceId(
+    workspaces.values(),
+    chats.values(),
+    explicitId,
+    canonicalRoot,
+  );
   const displayName =
     explicitName && explicitName.trim()
       ? explicitName
@@ -586,6 +599,13 @@ function registerIpcHandlers(): void {
       return { ok: false, error: "Prompt text cannot be empty." };
     }
 
+    const attempt: ActivePromptAttempt = {
+      token: ++nextPromptToken,
+      aborted: false,
+      dispatched: false,
+    };
+    activePromptByChatId.set(chatId, attempt);
+
     // Main process is the single source of truth for transcript messages and persistence.
     chat.composerDraft = "";
     const userMessage: ChatMessage = {
@@ -783,26 +803,87 @@ function registerIpcHandlers(): void {
       }
     };
 
-    let adapter: OmpRuntimeAdapter;
     try {
-      adapter = await ensureRunningAdapter();
-    } catch (err) {
-      diagnostics.lastError = err instanceof Error ? err.message : String(err);
-      return { ok: false, error: diagnostics.lastError };
-    }
+      let adapter: OmpRuntimeAdapter;
+      try {
+        adapter = await ensureRunningAdapter();
+      } catch (err) {
+        if (attempt.aborted) {
+          return { ok: true, agentInvoked: false };
+        }
+        diagnostics.lastError = err instanceof Error ? err.message : String(err);
+        return { ok: false, error: diagnostics.lastError };
+      }
 
-    try {
-      const promptRes = await adapter.sendPrompt(trimmed);
-      return { ok: true, agentInvoked: promptRes.agentInvoked };
-    } catch (err) {
-      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      // Guard dispatch after startup completes so a prompt cancelled during startup never reaches OMP.
+      if (attempt.aborted || activePromptByChatId.get(chatId)?.token !== attempt.token) {
+        return { ok: true, agentInvoked: false };
+      }
+
+      attempt.dispatched = true;
+      try {
+        const promptRes = await adapter.sendPrompt(trimmed);
+        return { ok: true, agentInvoked: promptRes.agentInvoked };
+      } catch (err) {
+        if (attempt.aborted) {
+          return { ok: true, agentInvoked: false };
+        }
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
+    } finally {
+      if (activePromptByChatId.get(chatId)?.token === attempt.token) {
+        activePromptByChatId.delete(chatId);
+      }
     }
   });
 
   ipcMain.handle("omp-desktop:abort-turn", async (_event, chatId: string) => {
-    const adapter = adaptersByChatId.get(chatId);
-    if (adapter && adapter.isRunning()) {
-      await adapter.abort();
+    const attempt = activePromptByChatId.get(chatId);
+    const startingAdapter = startingAdapterInstancesByChatId.get(chatId);
+    const readyAdapter = adaptersByChatId.get(chatId);
+
+    if (attempt) {
+      attempt.aborted = true;
+    }
+
+    // If the prompt was already dispatched to a running adapter, send RPC abort.
+    if (readyAdapter && readyAdapter.isRunning() && (!attempt || attempt.dispatched)) {
+      await readyAdapter.abort();
+      return;
+    }
+
+    // Otherwise Stop was pressed during startup (e.g. while a session_start dialog was waiting)
+    // or before prompt dispatch: cancel submission, dispose any starting adapter, clear startup
+    // dialogs, and settle the turn cleanly so the original prompt never runs.
+    if (startingAdapter) {
+      startingAdapterInstancesByChatId.delete(chatId);
+      await startingAdapter.dispose();
+    }
+
+    if (attempt || startingAdapter) {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send("omp-desktop:omp-event", {
+          chatId,
+          event: {
+            type: "prompt_result",
+            agentInvoked: false,
+            status: "aborted",
+            sessionSettled: true,
+          },
+        });
+      }
+      const targetChat = chats.get(chatId);
+      if (targetChat) {
+        const abortedMsg = appendAndPersistChatMessage(chatId, {
+          messageId: `sys-aborted-${Date.now()}-${targetChat.messages.length}`,
+          role: "system",
+          text: "Turn aborted.",
+          isRestoredMessage: false,
+        });
+        if (abortedMsg) {
+          broadcastChatMessage(chatId, abortedMsg);
+        }
+      }
     }
   });
 

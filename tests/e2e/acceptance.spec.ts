@@ -725,7 +725,20 @@ rl.on("close", () => process.exit(0));
       const winLive = await appLive.firstWindow();
       await winLive.waitForLoadState("domcontentloaded");
 
-      // Send a local command `/session info` first -> triggers startup `session_start` confirm dialog!
+      // 2a. Verify Stop pressed during startup approval cancels the pending submission cleanly
+      //     (disposes starting adapter, clears startup dialog, never dispatches the cancelled prompt!)
+      await winLive.getByTestId("composer-input").fill("cancelled-before-ready-prompt");
+      await winLive.getByTestId("composer-send-btn").click();
+      await expect(winLive.getByTestId("dialog-card-startup-confirm-1")).toBeVisible();
+      await expect(winLive.getByTestId("composer-abort-btn")).toBeVisible();
+      await winLive.getByTestId("composer-abort-btn").click();
+
+      await expect(winLive.getByTestId("dialog-card-startup-confirm-1")).toHaveCount(0);
+      await expect(winLive.getByTestId("composer-abort-btn")).toBeHidden();
+      await expect(winLive.getByTestId("composer-send-btn")).toBeEnabled();
+      await expect(winLive.getByTestId("chat-transcript")).toContainText("Turn aborted.");
+
+      // 2b. Send a local command `/session info` -> triggers startup `session_start` confirm dialog!
       await winLive.getByTestId("composer-input").fill("/session info");
       await winLive.getByTestId("composer-send-btn").click();
 
@@ -759,14 +772,31 @@ rl.on("close", () => process.exit(0));
       await winLive.getByTestId("dialog-submit-btn").click();
 
       // Structured ask dialog:
+      // - Typing then clearing single-choice write-in restores preset Staging automatically
       // - Single-choice q-env write-in automatically unchecks preset Staging & checks Other (mutually exclusive!)
       // - Multi-select q-suites allows BOTH checking Unit AND writing "nightly"
+      // - Switching to another chat and back preserves in-progress dialog inputs & selections!
       await expect(winLive.getByTestId("dialog-card-ask-1")).toBeVisible();
+      await winLive.getByTestId("dialog-ask-custom-q-env").fill("temporary-draft");
+      await expect(winLive.getByTestId("dialog-ask-other-q-env")).toBeChecked();
+      await winLive.getByTestId("dialog-ask-custom-q-env").fill("");
+      await expect(winLive.getByTestId("dialog-ask-opt-q-env-0")).toBeChecked();
+
       await winLive.getByTestId("dialog-ask-custom-q-env").fill("smoke-check");
       await expect(winLive.getByTestId("dialog-ask-opt-q-env-0")).not.toBeChecked();
       await expect(winLive.getByTestId("dialog-ask-other-q-env")).toBeChecked();
       await winLive.getByTestId("dialog-ask-opt-q-suites-0").check();
       await winLive.getByTestId("dialog-ask-custom-q-suites").fill("nightly");
+
+      // Switch to Standalone chat and back -> pending dialog answers must survive intact
+      await winLive.getByTestId("chat-item-chat-standalone-default").click();
+      await expect(winLive.getByTestId("dialog-card-ask-1")).toBeHidden();
+      await winLive.getByTestId("chat-item-chat-restored-workspace-a-001").click();
+      await expect(winLive.getByTestId("dialog-card-ask-1")).toBeVisible();
+      await expect(winLive.getByTestId("dialog-ask-custom-q-env")).toHaveValue("smoke-check");
+      await expect(winLive.getByTestId("dialog-ask-opt-q-suites-0")).toBeChecked();
+      await expect(winLive.getByTestId("dialog-ask-custom-q-suites")).toHaveValue("nightly");
+
       await winLive.getByTestId("dialog-submit-btn").click();
 
       await expect(winLive.getByTestId("chat-transcript")).toContainText(

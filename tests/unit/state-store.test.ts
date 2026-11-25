@@ -123,9 +123,28 @@ describe("DesktopStateStore (durable workspace & chat persistence)", () => {
       // Chat history itself is preserved so user never loses saved transcripts
       expect(reloaded!.chats).toHaveLength(1);
 
-      // Opening a new folder after restart MUST NOT reuse ws-1 held by the retained chat!
-      const nextId = allocateWorkspaceId(reloaded!.workspaces, reloaded!.chats);
+      // Opening a DIFFERENT folder after restart MUST NOT reuse ws-1 held by the retained chat!
+      const nextId = allocateWorkspaceId(reloaded!.workspaces, reloaded!.chats, undefined, canonicalNew);
       expect(nextId).toBe("ws-2");
+
+      // Reopening the SAME folder after it comes back online MUST recover ws-1 and reconnect its retained chat!
+      fs.mkdirSync(wsGone, { recursive: true });
+      const recoveredRoot = canonicalizeExistingPath(wsGone);
+      const recoveredId = allocateWorkspaceId(
+        reloaded!.workspaces,
+        reloaded!.chats,
+        undefined,
+        recoveredRoot,
+      );
+      expect(recoveredId).toBe("ws-1");
+      const reconnectedChat = findMatchingProjectChat(reloaded!.chats, {
+        workspaceId: recoveredId,
+        workspaceRoot: recoveredRoot,
+        displayName: "deleted-ws",
+      });
+      expect(reconnectedChat?.chatId).toBe("chat-ws-1-1");
+      // Remove wsGone again for the WORKSPACE_UNAVAILABLE assertion below
+      fs.rmSync(wsGone, { recursive: true, force: true });
 
       // Even if a workspace descriptor somehow carried ws-1 with a different root, it must NOT match the old chat
       const mismatchedReuse = findMatchingProjectChat(reloaded!.chats, {

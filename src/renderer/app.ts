@@ -57,7 +57,7 @@ const streamingTextByChatId = new Map<string, string>();
 const pendingDialogsByChatId = new Map<string, OmpDialogRequest[]>();
 const pendingOpenUrlByChatId = new Map<string, OpenUrlPromptItem>();
 const unconfiguredModelChatIds = new Set<string>();
-let renderedDialogChatId: string | null = null;
+const dialogContainerByChatId = new Map<string, HTMLElement>();
 let draftSyncTimer: ReturnType<typeof setTimeout> | null = null;
 
 const workspaceListEl = document.getElementById("workspace-list")!;
@@ -347,19 +347,29 @@ function syncStreamingCardInTranscript(): void {
   chatTranscriptEl.scrollTop = chatTranscriptEl.scrollHeight;
 }
 
-function renderChatDialogs(): void {
-  const pendingDialogs = pendingDialogsByChatId.get(activeChatId) ?? [];
-  const pendingOpenUrl = pendingOpenUrlByChatId.get(activeChatId);
+function reconcileChatDialogContainer(chatId: string): HTMLElement | null {
+  const pendingDialogs = pendingDialogsByChatId.get(chatId) ?? [];
+  const pendingOpenUrl = pendingOpenUrlByChatId.get(chatId);
+  let container = dialogContainerByChatId.get(chatId) ?? null;
 
-  if (renderedDialogChatId !== activeChatId) {
-    chatDialogsEl.innerHTML = "";
-    renderedDialogChatId = activeChatId;
+  if (pendingDialogs.length === 0 && !pendingOpenUrl) {
+    if (container) {
+      container.remove();
+      dialogContainerByChatId.delete(chatId);
+    }
+    return null;
   }
 
-  // Reconcile open_url card
-  const existingOpenUrlEl = chatDialogsEl.querySelector<HTMLElement>(
-    '[data-open-url-card="true"]',
-  );
+  if (!container) {
+    container = document.createElement("div");
+    container.className = "chat-dialog-group";
+    container.dataset.chatId = chatId;
+    dialogContainerByChatId.set(chatId, container);
+    chatDialogsEl.append(container);
+  }
+
+  // Reconcile open_url card inside this chat's container
+  const existingOpenUrlEl = container.querySelector<HTMLElement>('[data-open-url-card="true"]');
   if (!pendingOpenUrl) {
     existingOpenUrlEl?.remove();
   } else if (!existingOpenUrlEl || existingOpenUrlEl.dataset.targetUrl !== pendingOpenUrl.url) {
@@ -370,61 +380,75 @@ function renderChatDialogs(): void {
         await openBrowserTab(url);
       },
       () => {
-        pendingOpenUrlByChatId.delete(activeChatId);
+        pendingOpenUrlByChatId.delete(chatId);
         renderChatDialogs();
       },
     );
     urlCard.dataset.openUrlCard = "true";
     urlCard.dataset.targetUrl = pendingOpenUrl.url;
-    chatDialogsEl.prepend(urlCard);
+    container.prepend(urlCard);
   }
 
-  // Reconcile dialog request cards by id so in-progress user typing/focus is never lost
+  // Reconcile dialog request cards by id so in-progress user typing/focus is preserved across
+  // both streaming updates and chat switches.
   const activeIds = new Set(pendingDialogs.map((d) => d.id));
-  for (const child of Array.from(chatDialogsEl.querySelectorAll<HTMLElement>("[data-dialog-id]"))) {
+  for (const child of Array.from(container.querySelectorAll<HTMLElement>("[data-dialog-id]"))) {
     if (!activeIds.has(child.dataset.dialogId ?? "")) {
       child.remove();
     }
   }
 
-  const chatIdSnapshot = activeChatId;
   for (const req of pendingDialogs) {
-    const alreadyMounted = Array.from(chatDialogsEl.children).some(
+    const alreadyMounted = Array.from(container.children).some(
       (el) => (el as HTMLElement).dataset.dialogId === req.id,
     );
     if (alreadyMounted) {
       continue;
     }
     const card = buildOmpDialogCard(req, async (response) => {
-      const res = await api.respondToDialog(chatIdSnapshot, response);
+      const res = await api.respondToDialog(chatId, response);
       if (!res.ok) {
         if (res.error) {
           showError("OMP_DIALOG", res.error);
         }
         return false;
       }
-      const remaining = (pendingDialogsByChatId.get(chatIdSnapshot) ?? []).filter(
+      const remaining = (pendingDialogsByChatId.get(chatId) ?? []).filter(
         (item) => item.id !== req.id,
       );
       if (remaining.length > 0) {
-        pendingDialogsByChatId.set(chatIdSnapshot, remaining);
+        pendingDialogsByChatId.set(chatId, remaining);
       } else {
-        pendingDialogsByChatId.delete(chatIdSnapshot);
+        pendingDialogsByChatId.delete(chatId);
       }
       renderChatList();
-      if (activeChatId === chatIdSnapshot) {
-        renderChatDialogs();
-      }
+      renderChatDialogs();
       return true;
     });
     card.dataset.dialogId = req.id;
-    chatDialogsEl.append(card);
+    container.append(card);
   }
 
-  if (pendingDialogs.length === 0 && !pendingOpenUrl) {
-    chatDialogsEl.classList.add("hidden");
-  } else {
+  return container;
+}
+
+function renderChatDialogs(): void {
+  // Clean up any stale background chat containers that no longer have pending prompts
+  for (const chatId of Array.from(dialogContainerByChatId.keys())) {
+    if (chatId !== activeChatId) {
+      const c = reconcileChatDialogContainer(chatId);
+      if (c) {
+        c.classList.add("hidden");
+      }
+    }
+  }
+
+  const activeContainer = reconcileChatDialogContainer(activeChatId);
+  if (activeContainer) {
+    activeContainer.classList.remove("hidden");
     chatDialogsEl.classList.remove("hidden");
+  } else {
+    chatDialogsEl.classList.add("hidden");
   }
 }
 
@@ -1315,6 +1339,11 @@ function handleIncomingOmpEvent(payload: {
   if (event.type === "prompt_result") {
     streamingTextByChatId.delete(chatId);
     turnActiveChats.delete(chatId);
+    if (event.status === "aborted" && pendingDialogsByChatId.has(chatId)) {
+      pendingDialogsByChatId.delete(chatId);
+      renderChatList();
+      renderChatDialogs();
+    }
     if (chatId === activeChatId) {
       syncStreamingCardInTranscript();
       syncComposerStreamingControls();
@@ -1341,9 +1370,7 @@ function handleIncomingOmpEvent(payload: {
     filtered.push(event.request);
     pendingDialogsByChatId.set(chatId, filtered);
     renderChatList();
-    if (chatId === activeChatId) {
-      renderChatDialogs();
-    }
+    renderChatDialogs();
     return;
   }
 
@@ -1357,9 +1384,7 @@ function handleIncomingOmpEvent(payload: {
         pendingDialogsByChatId.delete(chatId);
       }
       renderChatList();
-      if (chatId === activeChatId) {
-        renderChatDialogs();
-      }
+      renderChatDialogs();
     }
     return;
   }
@@ -1372,9 +1397,7 @@ function handleIncomingOmpEvent(payload: {
         displayUrl: event.url,
         instructions: event.instructions,
       });
-      if (chatId === activeChatId) {
-        renderChatDialogs();
-      }
+      renderChatDialogs();
     } else if (chatId === activeChatId) {
       showError("BLOCKED_URL_SCHEME", "OMP requested an unsupported non-HTTP URL scheme.");
     }
@@ -1394,6 +1417,7 @@ function handleIncomingOmpEvent(payload: {
       turnActiveChats.delete(chatId);
       pendingDialogsByChatId.delete(chatId);
       renderChatList();
+      renderChatDialogs();
     }
     if (event.code === "NO_CONFIGURED_MODEL") {
       unconfiguredModelChatIds.add(chatId);
@@ -1402,14 +1426,12 @@ function handleIncomingOmpEvent(payload: {
         renderOnboardingSlot();
         syncStreamingCardInTranscript();
         syncComposerStreamingControls();
-        renderChatDialogs();
       }
       return;
     }
     if (chatId === activeChatId) {
       syncStreamingCardInTranscript();
       syncComposerStreamingControls();
-      renderChatDialogs();
       showError(event.code, event.message);
     }
   }

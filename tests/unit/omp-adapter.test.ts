@@ -881,4 +881,46 @@ setInterval(() => {}, 10000);
       fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
+
+  it("fails closed before spawning any child process when Job Object prepare() fails", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "omp-adapter-job-prep-"));
+    try {
+      const markerFile = path.join(tmp, "should-never-run.txt");
+      const markerScript = writeMockOmpScript(
+        tmp,
+        "fake-omp-marker",
+        `require("node:fs").writeFileSync(${JSON.stringify(markerFile)}, "spawned");`,
+      );
+
+      let assignCalled = false;
+      const adapter = new OmpRuntimeAdapter({
+        requireJobObject: true,
+        createJobObject: () => ({
+          isAssigned: () => false,
+          prepare: () => ({ ok: false, reason: "Simulated CreateJobObjectW failure" }),
+          assignProcess: () => {
+            assignCalled = true;
+            return { ok: true };
+          },
+          terminateAndClose: () => {},
+        }),
+      });
+
+      await expect(
+        adapter.start({
+          ompExecutablePath: process.execPath,
+          ompArgsPrefix: [markerScript],
+          scope: { kind: "standalone", standaloneCwd: path.join(tmp, "standalone") },
+          approvalMode: "always-ask",
+          requireProtocolV2: true,
+          shutdownTimeoutMs: 2_000,
+        }),
+      ).rejects.toThrow(/Failed to prepare Windows Job Object/i);
+
+      expect(assignCalled).toBe(false);
+      expect(fs.existsSync(markerFile)).toBe(false);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
+  });
 });

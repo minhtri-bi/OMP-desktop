@@ -8,12 +8,17 @@ const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
 const STILL_ACTIVE = 259;
 const ERROR_INVALID_PARAMETER = 87;
 
+export type Win32JobPrepareResult =
+  | { ok: true }
+  | { ok: false; reason: string };
+
 export type Win32JobAssignResult =
   | { ok: true }
   | { ok: false; reason: string; processAlreadyExited: boolean };
 
 export interface JobObjectSupervisor {
   isAssigned(): boolean;
+  prepare?(): Win32JobPrepareResult;
   assignProcess(pid: number): Win32JobAssignResult;
   terminateAndClose(exitCode?: number): void;
 }
@@ -128,6 +133,77 @@ export class Win32JobObject implements JobObjectSupervisor {
     return this.assigned && this.jobHandle !== null;
   }
 
+  prepare(): Win32JobPrepareResult {
+    if (process.platform !== "win32") {
+      return {
+        ok: false,
+        reason: "Win32 Job Object supervision is only available on Windows.",
+      };
+    }
+    if (this.jobHandle) {
+      return { ok: true };
+    }
+    const k32 = getKernel32();
+    if (!k32) {
+      return {
+        ok: false,
+        reason: "Failed to initialize kernel32.dll Job Object bindings.",
+      };
+    }
+
+    const hJob = k32.CreateJobObjectW(null, null);
+    if (!hJob) {
+      const lastErr = k32.GetLastError();
+      return {
+        ok: false,
+        reason: `CreateJobObjectW failed (Win32 error ${lastErr}).`,
+      };
+    }
+
+    const info = {
+      BasicLimitInformation: {
+        PerProcessUserTimeLimit: 0,
+        PerJobUserTimeLimit: 0,
+        LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        MinimumWorkingSetSize: 0,
+        MaximumWorkingSetSize: 0,
+        ActiveProcessLimit: 0,
+        Affinity: 0,
+        PriorityClass: 0,
+        SchedulingClass: 0,
+      },
+      IoInfo: {
+        ReadOperationCount: 0,
+        WriteOperationCount: 0,
+        OtherOperationCount: 0,
+        ReadTransferCount: 0,
+        WriteTransferCount: 0,
+        OtherTransferCount: 0,
+      },
+      ProcessMemoryLimit: 0,
+      JobMemoryLimit: 0,
+      PeakProcessMemoryUsed: 0,
+      PeakJobMemoryUsed: 0,
+    };
+
+    const configured = k32.SetInformationJobObject(
+      hJob,
+      JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+      info,
+      k32.extendedLimitSize,
+    );
+    if (!configured) {
+      const lastErr = k32.GetLastError();
+      k32.CloseHandle(hJob);
+      return {
+        ok: false,
+        reason: `SetInformationJobObject failed (Win32 error ${lastErr}).`,
+      };
+    }
+    this.jobHandle = hJob;
+    return { ok: true };
+  }
+
   assignProcess(pid: number): Win32JobAssignResult {
     if (process.platform !== "win32") {
       return {
@@ -143,69 +219,15 @@ export class Win32JobObject implements JobObjectSupervisor {
         processAlreadyExited: false,
       };
     }
-    const k32 = getKernel32();
-    if (!k32) {
+    const prepared = this.prepare();
+    if (!prepared.ok) {
       return {
         ok: false,
-        reason: "Failed to initialize kernel32.dll Job Object bindings.",
+        reason: prepared.reason,
         processAlreadyExited: false,
       };
     }
-
-    if (!this.jobHandle) {
-      const hJob = k32.CreateJobObjectW(null, null);
-      if (!hJob) {
-        const lastErr = k32.GetLastError();
-        return {
-          ok: false,
-          reason: `CreateJobObjectW failed (Win32 error ${lastErr}).`,
-          processAlreadyExited: false,
-        };
-      }
-
-      const info = {
-        BasicLimitInformation: {
-          PerProcessUserTimeLimit: 0,
-          PerJobUserTimeLimit: 0,
-          LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-          MinimumWorkingSetSize: 0,
-          MaximumWorkingSetSize: 0,
-          ActiveProcessLimit: 0,
-          Affinity: 0,
-          PriorityClass: 0,
-          SchedulingClass: 0,
-        },
-        IoInfo: {
-          ReadOperationCount: 0,
-          WriteOperationCount: 0,
-          OtherOperationCount: 0,
-          ReadTransferCount: 0,
-          WriteTransferCount: 0,
-          OtherTransferCount: 0,
-        },
-        ProcessMemoryLimit: 0,
-        JobMemoryLimit: 0,
-        PeakProcessMemoryUsed: 0,
-        PeakJobMemoryUsed: 0,
-      };
-
-      const configured = k32.SetInformationJobObject(
-        hJob,
-        JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
-        info,
-        k32.extendedLimitSize,
-      );
-      if (!configured) {
-        const lastErr = k32.GetLastError();
-        k32.CloseHandle(hJob);
-        return {
-          ok: false,
-          reason: `SetInformationJobObject failed (Win32 error ${lastErr}).`,
-          processAlreadyExited: false,
-        };
-      }
-      this.jobHandle = hJob;
-    }
+    const k32 = getKernel32()!;
 
     const hProcess = k32.OpenProcess(
       PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
