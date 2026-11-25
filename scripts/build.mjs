@@ -17,7 +17,7 @@ await Promise.all([
     platform: "node",
     format: "cjs",
     target: "node22",
-    external: ["electron"],
+    external: ["electron", "koffi"],
     outfile: path.join(distDir, "main/main.cjs"),
     sourcemap: true,
   }),

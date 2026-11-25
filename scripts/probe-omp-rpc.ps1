@@ -75,13 +75,67 @@ function Invoke-OmpRpcProbe {
         [Parameter(Mandatory)][string]$ResolvedOmpPath,
         [Parameter(Mandatory)][ValidateSet('rpc', 'rpc-ui')][string]$Mode,
         [Parameter(Mandatory)][int]$TimeoutSeconds,
-        [switch]$IncludeRecoveryChecks
+        [switch]$IncludeRecoveryChecks,
+        [switch]$UseSessionDirContinue,
+        [switch]$SeedSessionHistory
     )
 
     $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('omp-rpc-probe-' + [System.Guid]::NewGuid().ToString('N'))
     $probeCwd = Join-Path $tempRoot 'cwd'
     $probeAgentDir = Join-Path $tempRoot 'agent'
-    New-Item -ItemType Directory -Path $probeCwd, $probeAgentDir -Force | Out-Null
+    $probeSessionDir = Join-Path $tempRoot 'session'
+    New-Item -ItemType Directory -Path $probeCwd, $probeAgentDir, $probeSessionDir -Force | Out-Null
+
+    $seededSessionId = '11111111-1111-4111-8111-111111111111'
+    if ($SeedSessionHistory) {
+        $header = @{
+            type      = 'session'
+            version   = 3
+            id        = $seededSessionId
+            timestamp = '2026-11-24T00:00:00.000Z'
+            cwd       = $probeCwd
+        } | ConvertTo-Json -Compress -Depth 6
+        $userEntry = @{
+            type      = 'message'
+            id        = 'msg-u1'
+            parentId  = $null
+            timestamp = '2026-11-24T00:00:01.000Z'
+            message   = @{
+                role      = 'user'
+                content   = 'Project codename is Falcon'
+                timestamp = 1763942401000
+            }
+        } | ConvertTo-Json -Compress -Depth 6
+        $assistantEntry = @{
+            type      = 'message'
+            id        = 'msg-a1'
+            parentId  = 'msg-u1'
+            timestamp = '2026-11-24T00:00:02.000Z'
+            message   = @{
+                role       = 'assistant'
+                content    = @(@{ type = 'text'; text = 'Understood, codename Falcon recorded.' })
+                api        = 'openai-completions'
+                provider   = 'offline-probe'
+                model      = 'offline-probe-model'
+                usage      = @{
+                    input       = 10
+                    output      = 8
+                    cacheRead   = 0
+                    cacheWrite  = 0
+                    totalTokens = 18
+                    cost        = @{ input = 0; output = 0; cacheRead = 0; cacheWrite = 0; total = 0 }
+                }
+                stopReason = 'stop'
+                timestamp  = 1763942402000
+            }
+        } | ConvertTo-Json -Compress -Depth 8
+        $seededFile = Join-Path $probeSessionDir ("2026-11-24T00-00-00-000Z_${seededSessionId}.jsonl")
+        [System.IO.File]::WriteAllText(
+            $seededFile,
+            "$header`n$userEntry`n$assistantEntry`n",
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+    }
 
     # OMP v19.1.1 requires a selectable model to enter non-interactive RPC mode.
     # Use an isolated offline dummy provider (auth: none, unreachable loopback port 1); no prompt is ever sent.
@@ -110,9 +164,15 @@ providers:
         (New-Object System.Text.UTF8Encoding($false))
     )
 
+    $sessionArgs = if ($UseSessionDirContinue) {
+        "--session-dir `"$probeSessionDir`" --continue"
+    } else {
+        '--no-session'
+    }
+
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $ResolvedOmpPath
-    $psi.Arguments = "--mode $Mode --no-session --approval-mode always-ask --model offline-probe/offline-probe-model"
+    $psi.Arguments = "--mode $Mode $sessionArgs --approval-mode always-ask --model offline-probe/offline-probe-model"
     $psi.WorkingDirectory = $probeCwd
     $psi.UseShellExecute = $false
     $psi.RedirectStandardInput = $true
@@ -204,6 +264,19 @@ providers:
         }
         Write-Output "[$Mode] get_state: isStreaming=$($state.data.isStreaming), messageCount=$($state.data.messageCount), isSettled=$($state.data.isSettled)"
 
+        if ($SeedSessionHistory) {
+            if ($state.data.sessionId -ne $seededSessionId -or $state.data.messageCount -ne 2) {
+                throw "Expected --session-dir --continue to restore session $seededSessionId with 2 messages, got sessionId=$($state.data.sessionId), messageCount=$($state.data.messageCount)."
+            }
+            $stdinWriter.WriteLine('{"id":"p-resume","type":"get_messages_page","limit":10}')
+            $resumedPage = & $readUntil { param($f) $f.type -eq 'response' -and $f.id -eq 'p-resume' }
+            $resumedJson = ($resumedPage | ConvertTo-Json -Compress -Depth 10)
+            if (-not $resumedPage.success -or $resumedPage.data.totalMessages -ne 2 -or $resumedJson -notmatch 'Project codename is Falcon') {
+                throw "Expected resumed session messages to contain seeded Falcon context, got: $resumedJson"
+            }
+            Write-Output "[$Mode] verified real --session-dir --continue history restore: sessionId=$($state.data.sessionId), totalMessages=$($resumedPage.data.totalMessages)"
+        }
+
         if ($IncludeRecoveryChecks) {
             # 4. Verify command discovery surface
             $stdinWriter.WriteLine('{"id":"p3","type":"get_available_commands"}')
@@ -286,3 +359,5 @@ if ($LASTEXITCODE -ne 0) {
 Test-UnconfiguredRpcFailsFast -ResolvedOmpPath $resolvedOmp -TimeoutSeconds $TimeoutSeconds
 Invoke-OmpRpcProbe -ResolvedOmpPath $resolvedOmp -Mode 'rpc' -TimeoutSeconds $TimeoutSeconds -IncludeRecoveryChecks
 Invoke-OmpRpcProbe -ResolvedOmpPath $resolvedOmp -Mode 'rpc-ui' -TimeoutSeconds $TimeoutSeconds
+Invoke-OmpRpcProbe -ResolvedOmpPath $resolvedOmp -Mode 'rpc-ui' -TimeoutSeconds $TimeoutSeconds -UseSessionDirContinue
+Invoke-OmpRpcProbe -ResolvedOmpPath $resolvedOmp -Mode 'rpc-ui' -TimeoutSeconds $TimeoutSeconds -UseSessionDirContinue -SeedSessionHistory

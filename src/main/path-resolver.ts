@@ -57,6 +57,27 @@ export function normalizeForComparison(
 }
 
 /**
+ * Derives a guaranteed non-empty workspace display name.
+ * Falls back to the canonical normalized root (e.g. "D:/" or "/") when `path.basename` is empty for drive/filesystem roots.
+ */
+export function deriveWorkspaceDisplayName(rootPath: string): string {
+  const trimmed = stripWin32ExtendedPrefix(rootPath).trim();
+  if (!trimmed) {
+    return "/";
+  }
+  if (/^[a-zA-Z]:[\\/]?$/.test(trimmed)) {
+    return normalizePathSlashes(trimmed);
+  }
+  const base = /^[a-zA-Z]:[\\/]/.test(trimmed)
+    ? path.win32.basename(trimmed)
+    : path.basename(trimmed);
+  if (base && base !== "/" && base !== "\\") {
+    return base;
+  }
+  return normalizePathSlashes(trimmed);
+}
+
+/**
  * Verifies containment using exact case on canonicalized paths by default so
  * case-sensitive filesystems (Linux, or NTFS per-directory case-sensitive dirs)
  * cannot be bypassed by case-folding. Pass `caseInsensitive: true` only for
@@ -493,6 +514,16 @@ export function authorizeCanonicalReadPath(
     return real;
   }
 
+  if (
+    owningBinding.workspaceRoot.startsWith("\\\\") ||
+    owningBinding.workspaceRoot.startsWith("//")
+  ) {
+    throw new Error("Access denied: unsafe workspace root.");
+  }
+  const rootLs = fs.lstatSync(owningBinding.workspaceRoot);
+  if (rootLs.isSymbolicLink() || !rootLs.isDirectory()) {
+    throw new Error("Access denied: workspace root is unavailable or was replaced with a symlink.");
+  }
   const canonicalRoot = canonicalizeExistingPath(owningBinding.workspaceRoot);
   const walked = safeWalkWithinCanonicalRoot(canonicalRoot, candidatePath);
   if (!walked.ok) {
@@ -615,10 +646,23 @@ export function resolveMessageFileLink(request: MessageFileLinkRequest): PathRes
 
   // Project workspace binding
   const { workspaceRoot, workspaceDisplayName } = request.owningBinding;
-  if (!fs.existsSync(workspaceRoot)) {
+  if (workspaceRoot.startsWith("\\\\") || workspaceRoot.startsWith("//")) {
+    return fail("UNSAFE_PATH_SYNTAX", "UNC or device workspace root is blocked.", displayTarget);
+  }
+  let rootLs: fs.Stats;
+  try {
+    rootLs = fs.lstatSync(workspaceRoot);
+  } catch {
     return fail(
       "WORKSPACE_UNAVAILABLE",
       `Owning workspace "${workspaceDisplayName}" is no longer available on disk.`,
+      displayTarget,
+    );
+  }
+  if (rootLs.isSymbolicLink() || !rootLs.isDirectory()) {
+    return fail(
+      "OUT_OF_WORKSPACE",
+      `Owning workspace "${workspaceDisplayName}" was replaced with a symlink or non-directory.`,
       displayTarget,
     );
   }
@@ -634,7 +678,8 @@ export function resolveMessageFileLink(request: MessageFileLinkRequest): PathRes
     );
   }
 
-  const platformRelative = cleaned.replace(/\\/g, path.sep);
+  const platformRelative =
+    process.platform === "win32" ? cleaned.replace(/\\/g, path.sep) : cleaned;
   const candidatePath = isAbsolutePathCrossPlatform(cleaned)
     ? cleaned
     : path.resolve(canonicalRoot, platformRelative);

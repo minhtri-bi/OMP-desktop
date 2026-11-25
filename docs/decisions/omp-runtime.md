@@ -97,6 +97,6 @@ The same zero-cost probe runs automatically on Windows (`windows-2022`) in [`.gi
 
 ## Open items before implementation
 
-- [ ] Confirm standalone-chat CWD ancestor walk-up boundary on Windows (`%LOCALAPPDATA%\OMPDesktop\standalone-cwd` with a `.git` sentinel vs `--no-extensions` / empty repo root).
+- [x] Standalone-chat CWD ancestor walk-up boundary enforced by creating an empty `.git` sentinel inside `standalone-cwd` alongside a dedicated per-chat `--session-dir`.
 - [x] Default approval mode locked to `--approval-mode always-ask` (owner decision).
 - [x] Signed off on [`docs/contracts/omp-adapter.md`](../contracts/omp-adapter.md).
